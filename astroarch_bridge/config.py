@@ -1,18 +1,3 @@
-"""Configurazione applicazione - via env + file .env.
-
-DoD:
-- Carica da env vars con prefisso ASTROARCH_
-- Default sensati per RPi5/AstroArch
-- Token obbligatorio (refuse to start senza)
-- Path validati (creati se non esistono)
-
-Errori prevenuti:
-- E7: token mancante -> failure fast all'avvio
-- Path inesistenti che esploderebbero a runtime
-- Tipi sbagliati su porte/timeout
-"""
-from __future__ import annotations
-
 import os
 import secrets
 from functools import lru_cache
@@ -27,7 +12,7 @@ DEFAULT_TOKEN_FILE = Path.home() / ".config" / "astroarch-bridge" / "token"
 
 
 class Settings(BaseSettings):
-    """Settings del bridge. Tutte override-abili via env ASTROARCH_*."""
+    """Settings - all of them can be overridden via env vars ASTROARCH_*."""
 
     model_config = SettingsConfigDict(
         env_prefix="ASTROARCH_",
@@ -37,14 +22,14 @@ class Settings(BaseSettings):
     )
 
     # --- HTTP server ---
-    host: str = Field(default="0.0.0.0", description="Bind address (0.0.0.0 per Tailscale)")
+    host: str = Field(default="0.0.0.0", description="Bind address (0.0.0.0 for Tailscale)")
     port: int = Field(default=8765, ge=1, le=65535)
     log_level: str = Field(default="INFO")
 
     # --- Auth ---
-    token: str = Field(default="", description="Bearer token. Se vuoto, viene letto da token_file.")
+    token: str = Field(default="", description="Bearer token. If empty, read from token_file.")
     token_file: Path = Field(default=DEFAULT_TOKEN_FILE)
-    auto_generate_token: bool = Field(default=True, description="Se True, genera token random alla prima esecuzione.")
+    auto_generate_token: bool = Field(default=True, description="If true, generates a random token on the first start")
 
     # --- INDI server ---
     indi_host: str = Field(default="127.0.0.1")
@@ -63,17 +48,17 @@ class Settings(BaseSettings):
     images_dir: Path = Field(default=DEFAULT_IMAGES_DIR)
     image_jpeg_quality: int = Field(default=85, ge=10, le=100)
     image_max_dim: int = Field(default=1600, ge=200, le=8192,
-                               description="Lato max JPEG inviato all'app.")
+                               description="Biggest axis (X or Y) of the image, in pixels")
     image_stabilize_ms: int = Field(default=500, ge=100, le=5000,
-                                    description="Ms di attesa con size invariata prima di leggere FITS.")
+                                    description="waiting (in ms) before reading the FITS.")
     image_thumbnail_dim: int = Field(default=512, ge=64, le=2048)
 
     # --- WS ---
     ws_state_max_clients: int = Field(default=8, ge=1, le=64)
     ws_frames_max_clients: int = Field(default=4, ge=1, le=32)
     ws_send_queue: int = Field(default=1024, ge=4, le=8192,
-                               description="Backpressure: drop oldest se coda piena. "
-                                           "Deve essere >= 2x il numero di property INDI per non perdere lo snapshot iniziale.")
+                               description="Backpressure: drop oldest message if queue is full"
+                                           "Must be >= 2x the number of INDI properties")
 
     # --- Misc ---
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
@@ -115,25 +100,25 @@ class Settings(BaseSettings):
         try:
             os.chmod(self.token_file, 0o600)
         except OSError:
-            pass  # Windows non supporta chmod stile unix
+            pass
         return new_tok
 
     def ensure_paths(self) -> None:
-        """Crea cartelle necessarie. Idempotente."""
+        """Make sure needed folders are created. Idempotent."""
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Singleton settings. Side-effect: assicura path e token alla prima chiamata."""
+    """Singleton settings. Side-effect: ensure paths and tokens on boot."""
     s = Settings()
     s.ensure_paths()
-    # Forza la risoluzione del token all'avvio (errori subito, non dopo).
+    # Ensure token is fetched on start
     _ = s.resolve_token()
     return s
 
 
 def reset_settings_cache() -> None:
-    """Per testing: resetta il cache singleton."""
+    """Test only function. Resets the singleton"""
     get_settings.cache_clear()
