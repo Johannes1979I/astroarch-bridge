@@ -6,7 +6,7 @@ import sys
 
 import uvicorn
 
-from .config import get_settings
+from astroarch_bridge.config import get_settings
 
 
 def main() -> int:
