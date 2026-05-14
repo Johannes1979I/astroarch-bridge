@@ -72,9 +72,9 @@ userdb) and forwards to the app.
 
 > Tested on AstroArch (ArchLinux ARM) + Raspberry Pi 5. Setup time: **~5 minutes**.
 
-AstroArch already ships KStars 3.8.x, Ekos with DBus, INDI server,
-PHD2, Python 3.11+, `qdbus6`, `dbus-monitor`, and systemd user
-services. So the only thing you need is to install this bridge.
+Install it directly via pacman with `sudo pacman -S astroarch-bridge`
+
+If you want to test it locally and run it/modify be sure to have uv installed, otherwise install it via `sudo pacman -S python-uv` then:
 
 ### 1) Clone + install
 
@@ -82,7 +82,7 @@ services. So the only thing you need is to install this bridge.
 ssh astronaut@RPI_IP
 git clone https://github.com/Johannes1979I/astroarch-bridge
 cd astroarch-bridge
-sudo bash deploy/install.sh --user astronaut
+make run-app (or uv run astroarch_bridge)
 ```
 
 The script:
