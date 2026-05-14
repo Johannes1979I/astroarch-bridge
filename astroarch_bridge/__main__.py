@@ -7,6 +7,7 @@ import sys
 import uvicorn
 
 from astroarch_bridge.config import get_settings
+from astroarch_bridge.splash import show_start_summary
 
 
 def main() -> int:
@@ -15,12 +16,13 @@ def main() -> int:
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    log = logging.getLogger("astroarch_bridge")
-    log.info("starting astroarch-bridge on %s:%d", settings.host, settings.port)
-    log.info("INDI=%s:%d  PHD2=%s:%d  watch=%s",
-             settings.indi_host, settings.indi_port,
-             settings.phd2_host, settings.phd2_port,
-             settings.images_dir)
+    logger = logging.getLogger("astroarch_bridge")
+    show_start_summary(logger)
+    logger.info("INDI=%s:%d  PHD2=%s:%d  watch=%s",
+                settings.indi_host, settings.indi_port,
+                settings.phd2_host, settings.phd2_port,
+                settings.images_dir)
+    logger.info("starting astroarch-bridge on %s:%d", settings.host, settings.port)
     uvicorn.run(
         "astroarch_bridge.app:create_app",
         factory=True,
