@@ -56,6 +56,10 @@ class StateManager:
         self._phd2_live: dict[str, Any] = {}
         self._connections = ConnectionsView()
         self._last_frame_meta: dict[str, Any] = {}
+        # v0.3.15: conserva l'ultimo JPEG in RAM così l'app può recuperarlo
+        # via REST (es. al rientro da background, quando la WS /ws/frames si è
+        # riconnessa ma il bridge non re-invia l'ultimo frame già broadcastato).
+        self._last_jpeg: bytes = b""
         self._listeners: list[StateListener] = []
         self._frame_listeners: list[FrameListener] = []
 
@@ -250,6 +254,7 @@ class StateManager:
                 **meta,
                 "ts": time.time(),
             }
+            self._last_jpeg = jpeg  # v0.3.15: per recupero REST
             last = dict(self._last_frame_meta)
         # /ws/state riceve solo metadata (senza jpeg)
         await self._broadcast({"type": "frame_meta", "frame": last})
@@ -272,6 +277,12 @@ class StateManager:
                 "last_frame": dict(self._last_frame_meta),
                 "messages": list(self._messages[-20:]),
             }
+
+    async def last_jpeg(self) -> tuple[bytes, dict]:
+        """v0.3.15: ultimo JPEG intercettato + i suoi metadati. Per recupero
+        REST quando la WS non lo ri-invia (es. rientro da background)."""
+        async with self._lock:
+            return self._last_jpeg, dict(self._last_frame_meta)
 
     async def get_device_properties(self, device: str) -> list[dict]:
         async with self._lock:

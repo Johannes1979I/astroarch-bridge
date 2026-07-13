@@ -1,6 +1,6 @@
 [project]
 name = "astroarch-bridge"
-version = "0.3.14"
+version = "0.3.16"
 description = "Bridge daemon for Astroarch Interface (Android app) - live clone of INDI/Ekos/PHD2 via REST + WebSocket"
 authors = [{name = "Zarletti-Osservatorio Jupiter"}]
 license = {text = "MIT"}

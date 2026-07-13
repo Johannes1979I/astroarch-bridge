@@ -30,6 +30,27 @@ async def connections(bridge: Bridge = Depends(get_bridge)) -> dict:
     return snap["connections"]
 
 
+@router.get("/last_frame")
+async def last_frame(bridge: Bridge = Depends(get_bridge)):
+    """v0.3.15: ultimo frame JPEG intercettato dalla camera, su richiesta.
+    Serve all'app per ricaricare l'immagine quando la WS /ws/frames non la
+    re-invia (es. al rientro da background: il frame era già stato
+    broadcastato mentre l'app era sospesa). 404 se nessun frame ancora.
+    I metadati vanno negli header X-*."""
+    from fastapi import HTTPException
+    from fastapi.responses import Response
+    jpeg, meta = await bridge.state.last_jpeg()
+    if not jpeg:
+        raise HTTPException(status_code=404, detail="nessun frame disponibile")
+    headers = {"Cache-Control": "no-store"}
+    for k in ("ts", "width", "height", "hfr", "stars", "filter",
+              "exposure", "frame_type", "object"):
+        v = meta.get(k)
+        if v is not None:
+            headers[f"X-{k}"] = str(v)
+    return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+
+
 @router.get("/devices")
 async def devices(bridge: Bridge = Depends(get_bridge)) -> dict:
     return {"devices": await bridge.state.list_devices()}

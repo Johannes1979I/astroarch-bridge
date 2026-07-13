@@ -45,7 +45,7 @@ def _resolve_version() -> str:
             pass
     except Exception:
         pass
-    return "0.3.14"  # hardcoded fallback, KEEP IN SYNC con pyproject.toml
+    return "0.3.16"  # hardcoded fallback, KEEP IN SYNC con pyproject.toml
 
 
 __version__ = _resolve_version()
