@@ -303,6 +303,28 @@ def _read_ekos_dither_settings() -> dict:
     return out
 
 
+def _read_ekos_dither_enabled() -> bool:
+    """True se l'utente ha abilitato il Dither in Ekos (kstarsrc [Guide]
+    DitherEnabled). Default True se la chiave manca (come Ekos di default).
+    Letto read-only, non modifica nulla. Usato da /ekos_start_existing per
+    decidere se armare il watcher quando l'app non passa un override."""
+    cfg = Path.home() / ".config/kstarsrc"
+    if not cfg.exists():
+        return True
+    try:
+        in_guide = False
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                in_guide = (s == "[Guide]")
+                continue
+            if in_guide and s.startswith("DitherEnabled="):
+                return s.split("=", 1)[1].strip().lower() in ("true", "1")
+    except Exception as e:
+        _logger.warning("cannot read Ekos DitherEnabled: %s", e)
+    return True
+
+
 def _read_active_train_name() -> str:
     """Risolve il NOME del train attivo dalla userdb di KStars usando
     CaptureTrainID di kstarsrc. Ritorna stringa vuota se non lo trova.
@@ -709,6 +731,118 @@ async def ekos_run(payload: dict = Body(...), bridge: Bridge = Depends(get_bridg
         "start_response": start_msg,
         "jobs_count": len(jobs),
         "auto_dither_enabled": any_dither,
+    }
+
+
+@router.post("/ekos_start_existing")
+async def ekos_start_existing(
+    payload: dict = Body(default={}),
+    bridge: Bridge = Depends(get_bridge),
+) -> dict:
+    """v0.3.17: avvia la sequenza GIÀ caricata nella Capture queue di Ekos,
+    SENZA clear/load dei job dell'app.
+
+    A differenza di /ekos_run (che fa clearSequenceQueue + loadSequenceQueue
+    sovrascrivendo la coda con i job dell'app), questo endpoint rispetta
+    ESATTAMENTE la sequenza che l'utente ha pianificato a mano nella UI di
+    Ekos sul desktop. Il bridge si limita a:
+      1. verificare che una sequenza sia effettivamente caricata (job_count>0);
+      2. Capture.start(train) sul train attivo;
+      3. armare l'auto-dither bridge-native se il dither è abilitato in Ekos.
+
+    NON tocca montatura, guida PHD2, cooler né la sequenza: è la modalità
+    più non-invasiva possibile ("premi play su quello che ho già preparato").
+
+    Body (tutto opzionale):
+      train: str — optical train; se vuoto risolve quello attivo dal userdb.
+      auto_dither: bool|null — forza on/off del watcher dither bridge-native.
+                   Se assente/null legge DitherEnabled da Ekos [Guide].
+      dither* : override espliciti dei parametri (come /ekos_run).
+    """
+    train = payload.get("train") or ""
+
+    # 1. Deve esserci una sequenza già pianificata a mano in Ekos.
+    rc_jc, val_jc = await _dbus_call(
+        EKOS_DBUS_SERVICE, EKOS_CAPTURE_PATH,
+        "org.kde.kstars.Ekos.Capture.getJobCount")
+    job_count = int(val_jc) if rc_jc == 0 and val_jc.isdigit() else 0
+    if job_count <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Nessuna sequenza pianificata in Ekos. Apri Ekos sul "
+                   "desktop e aggiungi almeno un job alla Capture queue, "
+                   "oppure usa 'Via Ekos' per inviare i job dell'app.")
+
+    # 2. Risolvi il nome del train e avvia la sequenza esistente.
+    #    Usiamo il nome risolto (non "") perché su molte versioni di Ekos
+    #    Capture.start("") fallisce silenziosamente (vedi commento v0.3.5).
+    effective_train = train or _read_active_train_name() or ""
+    rc_st, out_st = await _dbus_call(
+        EKOS_DBUS_SERVICE, EKOS_CAPTURE_PATH,
+        "org.kde.kstars.Ekos.Capture.start", effective_train)
+    started = rc_st == 0
+    if not started:
+        raise HTTPException(status_code=500,
+                            detail=f"Capture.start fallito: {out_st}")
+
+    # 3. Auto-dither bridge-native.
+    #    on/off: override esplicito del payload, altrimenti DitherEnabled di
+    #    Ekos. I parametri (px, settle, freq) vengono SEMPRE da Ekos —
+    #    coerente con "usa esattamente la mia configurazione Ekos".
+    want_dither = payload.get("auto_dither")
+    if want_dither is None:
+        want_dither = _read_ekos_dither_enabled()
+    want_dither = bool(want_dither)
+
+    ekos_dither = _read_ekos_dither_settings()
+    if ekos_dither.get("amount") is not None:
+        _auto_dither_state["amount"] = float(ekos_dither["amount"])
+    if ekos_dither.get("settle_time") is not None:
+        _auto_dither_state["settle_time"] = float(ekos_dither["settle_time"])
+    # frequency: GuideDitherPerJobFrequency da [Capture] (come /ekos_run)
+    cfg_kstars = Path.home() / ".config/kstarsrc"
+    if cfg_kstars.exists():
+        try:
+            in_cap = False
+            for line in cfg_kstars.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s.startswith("[") and s.endswith("]"):
+                    in_cap = (s == "[Capture]"); continue
+                if in_cap and s.startswith("GuideDitherPerJobFrequency="):
+                    try: _auto_dither_state["frequency"] = max(1, int(s.split("=", 1)[1]))
+                    except ValueError: pass
+        except Exception:
+            pass
+    # override espliciti dal payload (massima priorità, come /ekos_run)
+    if payload.get("ditherAmount") is not None:
+        _auto_dither_state["amount"] = float(payload["ditherAmount"])
+    if payload.get("ditherSettleTime") is not None:
+        _auto_dither_state["settle_time"] = float(payload["ditherSettleTime"])
+    if payload.get("ditherSettlePixels") is not None:
+        _auto_dither_state["settle_pixels"] = float(payload["ditherSettlePixels"])
+    if payload.get("ditherFrequency") is not None:
+        _auto_dither_state["frequency"] = max(1, int(payload["ditherFrequency"]))
+    if payload.get("ditherRaOnly") is not None:
+        _auto_dither_state["ra_only"] = bool(payload["ditherRaOnly"])
+
+    _logger.info("ekos_start_existing: job_count=%d train=%r auto_dither=%s "
+                 "(amount=%.1fpx settle=%.0fs freq=%d)",
+                 job_count, effective_train, want_dither,
+                 _auto_dither_state["amount"], _auto_dither_state["settle_time"],
+                 _auto_dither_state["frequency"])
+
+    if want_dither:
+        await _start_auto_dither(bridge, effective_train)
+    else:
+        await _stop_auto_dither()
+
+    return {
+        "ok": True,
+        "started": started,
+        "start_response": out_st,
+        "job_count": job_count,
+        "train": effective_train,
+        "auto_dither_enabled": want_dither,
     }
 
 
