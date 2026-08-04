@@ -60,6 +60,11 @@ class StateManager:
         # via REST (es. al rientro da background, quando la WS /ws/frames si è
         # riconnessa ma il bridge non re-invia l'ultimo frame già broadcastato).
         self._last_jpeg: bytes = b""
+        # v0.3.18: timestamp (monotonic) dell'ultimo BLOB camera ricevuto.
+        # Il capture-preview worker lo usa per NON duplicare i frame: se un
+        # BLOB è arrivato di recente (upload CLIENT/BOTH) non rilegge il FITS
+        # da disco; in upload LOCAL nessun BLOB arriva → legge il file.
+        self._last_blob_ts: float = 0.0
         self._listeners: list[StateListener] = []
         self._frame_listeners: list[FrameListener] = []
 
@@ -155,6 +160,7 @@ class StateManager:
                     # Mantieni i bytes per processing fuori dal lock
                     if blob and len(blob) > 1024:  # filtra blob piccoli
                         blob_payloads.append(blob)
+                        self._last_blob_ts = time.monotonic()
                         log.info("INDI BLOB received device=%s prop=%s elt=%s size=%d bytes",
                                  ev.device, ev.name, elt_name, len(blob))
                     continue
@@ -202,6 +208,50 @@ class StateManager:
             "source": "blob",
         }
         await self.handle_frame(meta["path"], result.jpeg, result.thumbnail, meta)
+
+    def seconds_since_last_blob(self) -> float:
+        """Secondi dall'ultimo BLOB camera ricevuto via INDI (grande se mai)."""
+        if self._last_blob_ts <= 0.0:
+            return 1e9
+        return time.monotonic() - self._last_blob_ts
+
+    async def push_fits_file(self, path: str) -> bool:
+        """Legge un FITS da disco, lo processa e lo invia all'app come frame.
+
+        Serve quando la camera è in upload mode LOCAL durante una sequenza:
+        Ekos salva i FITS sul disco del Pi ma NON li trasmette via INDI, quindi
+        il bridge non riceve BLOB. Il capture-preview worker chiama questo
+        metodo con l'ultima posa salvata così l'app mostra comunque il frame.
+        Ritorna True se il frame è stato inviato all'app."""
+        try:
+            data = await asyncio.to_thread(lambda p=path: open(p, "rb").read())
+        except Exception as e:
+            log.warning("push_fits_file: cannot read %s: %s", path, e)
+            return False
+        if len(data) < 80 or not data.startswith(b"SIMPLE"):
+            log.warning("push_fits_file: %s non è un FITS (skip)", path)
+            return False
+        try:
+            from .images.processor import process_fits_bytes_async
+            result = await process_fits_bytes_async(data)
+        except Exception as e:
+            log.warning("push_fits_file: process failed for %s: %s", path, e)
+            return False
+        meta = {
+            "path": path,
+            "name": path.rsplit("/", 1)[-1],
+            "width": result.width, "height": result.height,
+            "median": result.median, "vmin": result.vmin, "vmax": result.vmax,
+            "hfr": result.hfr_approx, "stars": result.star_count,
+            "is_color": result.is_color, "bayer": result.bayer_pattern,
+            "exposure": result.exposure, "filter": result.filter_name,
+            "frame_type": result.frame_type, "object": result.object_name,
+            "source": "disk",
+        }
+        await self.handle_frame(path, result.jpeg, result.thumbnail, meta)
+        log.info("push_fits_file: frame da disco inviato (%s, %dx%d)",
+                 meta["name"], result.width, result.height)
+        return True
 
     async def _on_del(self, ev: IndiEvent) -> None:
         async with self._lock:

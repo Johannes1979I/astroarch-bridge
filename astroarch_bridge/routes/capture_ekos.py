@@ -520,6 +520,117 @@ async def _stop_auto_dither() -> None:
     _logger.info("auto-dither: worker stopped")
 
 
+# ============================================================================
+# v0.3.18: capture-preview worker — mostra nell'app i frame della SEQUENZA
+# anche quando la camera è in upload mode LOCAL (Ekos salva i FITS su disco e
+# NON li trasmette via INDI → il bridge non riceve BLOB). Fa polling della
+# cartella di cattura di Ekos e, ad ogni nuova posa salvata, la invia all'app —
+# SALVO che sia arrivato un BLOB di recente (upload CLIENT/BOTH: il frame è già
+# stato mostrato, niente doppione). È read-only sul disco: nessuna modifica
+# alla config o ai file dell'utente.
+# ============================================================================
+_capture_preview_state = {"enabled": False}
+_capture_preview_task: "asyncio.Task | None" = None
+_capture_preview_bridge = None
+
+_FITS_EXTS = (".fits", ".fit", ".fts")
+
+
+def _latest_fits_in(root: str) -> "tuple[str, float] | None":
+    """(path, mtime) del FITS più recente sotto `root` (ricorsivo), o None."""
+    latest_path = None
+    latest_mtime = -1.0
+    try:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                if fn.lower().endswith(_FITS_EXTS):
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        m = os.path.getmtime(fp)
+                    except OSError:
+                        continue
+                    if m > latest_mtime:
+                        latest_mtime = m
+                        latest_path = fp
+    except Exception as e:
+        _logger.warning("capture-preview: scan %s failed: %s", root, e)
+    if latest_path is None:
+        return None
+    return latest_path, latest_mtime
+
+
+async def _capture_preview_worker() -> None:
+    """Polling della cartella di cattura: invia all'app l'ultima posa salvata
+    su disco quando la camera è in upload LOCAL (nessun BLOB). Read-only."""
+    bridge = _capture_preview_bridge
+    # Marker iniziale: il file già presente più recente NON va re-inviato
+    # (non è una posa nuova di questa sequenza).
+    last_mtime = 0.0
+    try:
+        settings = _read_ekos_capture_settings(_read_active_train_id())
+        cur = _latest_fits_in(settings.get("fits_dir") or "")
+        if cur:
+            last_mtime = cur[1]
+    except Exception:
+        pass
+    idle_cycles = 0
+    _logger.info("capture-preview: worker started")
+    while _capture_preview_state["enabled"]:
+        await asyncio.sleep(4.0)
+        try:
+            settings = _read_ekos_capture_settings(_read_active_train_id())
+            fits_dir = settings.get("fits_dir")
+            cur = _latest_fits_in(fits_dir) if fits_dir else None
+            if cur and cur[1] > last_mtime + 0.001:
+                path, mtime = cur
+                last_mtime = mtime
+                idle_cycles = 0
+                if bridge is None:
+                    pass
+                elif bridge.state.seconds_since_last_blob() <= 8.0:
+                    # Upload CLIENT/BOTH: frame già mostrato via BLOB → no doppione.
+                    _logger.info("capture-preview: nuova posa ma BLOB recente → skip")
+                else:
+                    # Upload LOCAL: leggi il file da disco e invialo all'app.
+                    await asyncio.sleep(0.6)  # attende la fine scrittura
+                    await bridge.state.push_fits_file(path)
+            else:
+                idle_cycles += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _logger.warning("capture-preview: loop error: %s", e)
+            idle_cycles += 1
+        # auto-stop dopo ~20 min senza nuove pose (sequenza probabilmente finita)
+        if idle_cycles > 300:
+            _logger.info("capture-preview: nessuna nuova posa per ~20min → stop")
+            break
+    _capture_preview_state["enabled"] = False
+    _logger.info("capture-preview: worker stopped")
+
+
+async def _start_capture_preview(bridge) -> None:
+    """Avvia il capture-preview worker (idempotente)."""
+    global _capture_preview_task, _capture_preview_bridge
+    _capture_preview_bridge = bridge
+    _capture_preview_state["enabled"] = True
+    if _capture_preview_task is None or _capture_preview_task.done():
+        _capture_preview_task = asyncio.create_task(_capture_preview_worker())
+
+
+async def _stop_capture_preview() -> None:
+    """Ferma il capture-preview worker (idempotente)."""
+    global _capture_preview_task
+    _capture_preview_state["enabled"] = False
+    if _capture_preview_task is not None and not _capture_preview_task.done():
+        _capture_preview_task.cancel()
+        try:
+            await _capture_preview_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _capture_preview_task = None
+
+
 async def _dbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     """Esegue qdbus6 e ritorna (returncode, stdout)."""
     env = os.environ.copy()
@@ -722,6 +833,10 @@ async def ekos_run(payload: dict = Body(...), bridge: Bridge = Depends(get_bridg
         await _start_auto_dither(bridge, effective_train)
     else:
         await _stop_auto_dither()
+    # v0.3.18: capture-preview worker — mostra i frame della sequenza nell'app
+    # anche in upload LOCAL. Attivo per tutta la sequenza, indipendente dal dither.
+    if started:
+        await _start_capture_preview(bridge)
     return {
         "ok": True,
         "esq_path": str(esq_path),
@@ -836,6 +951,11 @@ async def ekos_start_existing(
     else:
         await _stop_auto_dither()
 
+    # v0.3.18: capture-preview worker (mostra i frame della sequenza in app
+    # anche in upload LOCAL), indipendente dal dither.
+    if started:
+        await _start_capture_preview(bridge)
+
     return {
         "ok": True,
         "started": started,
@@ -882,6 +1002,8 @@ async def ekos_status() -> dict:
 async def ekos_abort() -> dict:
     # v0.3.4: ferma anche il watcher auto-dither
     await _stop_auto_dither()
+    # v0.3.18: ferma anche il capture-preview worker
+    await _stop_capture_preview()
     rc, out = await _dbus_call(EKOS_DBUS_SERVICE, EKOS_CAPTURE_PATH,
                                 "org.kde.kstars.Ekos.Capture.abort", "")
     return {"ok": rc == 0, "raw": out}
