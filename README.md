@@ -182,6 +182,7 @@ align/     status, solve, ekos_full_status, ekos_capture_and_solve,
            ekos_align_set, ekos_align_abort, polar_align/run
 capture/   ekos_alive, ekos_run, ekos_status, ekos_abort,
            ekos_clear, ekos_user_settings, preview_esq
+notify/    push, recent   (offline alerts from external tools)
 observation/  run, status, abort   (full pre-flight orchestrator)
 files/     recent, preview, delete, disk_usage
 indi/      devices/{dev}/properties, refresh, connect, disconnect
@@ -199,6 +200,44 @@ WebSockets:
 
 Auth: every endpoint (except `/healthz`) requires `Authorization:
 Bearer <token>`.
+
+---
+
+## Offline notifications
+
+Under a dark sky there is usually no connectivity, so alerting services
+that relay through the internet are of no use. Any program running
+alongside the bridge can instead send it a plain UDP datagram, which the
+bridge republishes on `/ws/state` as a `notification` event — every
+client already connected (Android app, browser, tablet) shows it, with
+no extra infrastructure and no internet.
+
+```bash
+# plain text
+echo -n "KStars has stopped." | nc -u -w0 127.0.0.1 5005
+
+# or JSON, for a level and a title
+echo -n '{"title":"Weather","message":"clouds incoming","level":"warning"}' \
+  | nc -u -w0 127.0.0.1 5005
+```
+
+The listener binds to **loopback only** by default, because the normal
+sender runs on the same machine as KStars. To receive from another host
+on the observing LAN, set `ASTROARCH_NOTIFY_UDP_HOST=0.0.0.0`; bear in
+mind that anyone on that network can then post a notification. Set
+`ASTROARCH_NOTIFY_UDP_ENABLED=false` to close the socket entirely.
+
+| Env var | Default |
+|---|---|
+| `ASTROARCH_NOTIFY_UDP_ENABLED` | `true` |
+| `ASTROARCH_NOTIFY_UDP_HOST` | `127.0.0.1` |
+| `ASTROARCH_NOTIFY_UDP_PORT` | `5005` |
+
+Senders that already speak HTTP can use `POST /api/notify` instead,
+which takes the same fields and requires the bearer token. The last 50
+notifications are kept in memory: they ride along in the WebSocket
+snapshot, so a tablet that was asleep still sees what it missed on
+reconnect, and `GET /api/notify/recent` returns them on demand.
 
 ---
 

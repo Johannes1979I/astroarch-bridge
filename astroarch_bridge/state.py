@@ -53,6 +53,11 @@ class StateManager:
         self._properties: dict[str, Property] = {}  # key = "device::name"
         self._devices: set[str] = set()
         self._messages: list[dict] = []  # ultimi messaggi INDI (cap 100)
+        # Notifications from external programs (astro_monitor & co.),
+        # received over UDP or REST. Kept in memory so that a reconnecting
+        # client finds them in the snapshot instead of losing them: in the
+        # field the tablet is often asleep exactly when the alert fires.
+        self._notifications: list[dict] = []  # cap 50
         self._phd2_live: dict[str, Any] = {}
         self._connections = ConnectionsView()
         self._last_frame_meta: dict[str, Any] = {}
@@ -282,6 +287,46 @@ class StateManager:
                 self._messages = self._messages[-100:]
         await self._broadcast({"type": "indi_message", **msg})
 
+    # --- Notifiche esterne --------------------------------------------------
+
+    async def handle_notification(self, payload: dict) -> dict:
+        """Record an external notification and push it to connected clients.
+
+        `payload` arrives already normalised, from notify/listener.py or from
+        the REST route. Returns the notification as stored (with its
+        timestamp), which the route uses to answer the sender.
+        """
+        notif = {
+            "title": payload.get("title", ""),
+            "message": payload.get("message", ""),
+            "level": payload.get("level", "info"),
+            "source": payload.get("source", ""),
+            "ts": time.time(),
+        }
+        async with self._lock:
+            self._notifications.append(notif)
+            if len(self._notifications) > 50:
+                self._notifications = self._notifications[-50:]
+        await self._broadcast({"type": "notification", **notif})
+        return notif
+
+    async def recent_notifications(self, limit: int = 50) -> list[dict]:
+        async with self._lock:
+            return list(self._notifications[-limit:])
+
+    async def clear_notifications(self) -> int:
+        """Empty the alert history. Returns how many were dropped.
+
+        The history lives here rather than in each client, so clearing it in
+        one app would be undone by the next reconnect, which repopulates the
+        client from the snapshot. Clearing it at the source is what actually
+        clears it, for every client at once.
+        """
+        async with self._lock:
+            n = len(self._notifications)
+            self._notifications.clear()
+            return n
+
     # --- PHD2 ingest --------------------------------------------------------
 
     async def handle_phd2_event(self, ev: dict) -> None:
@@ -326,6 +371,7 @@ class StateManager:
                 "phd2": dict(self._phd2_live),
                 "last_frame": dict(self._last_frame_meta),
                 "messages": list(self._messages[-20:]),
+                "notifications": list(self._notifications[-20:]),
             }
 
     async def last_jpeg(self) -> tuple[bytes, dict]:

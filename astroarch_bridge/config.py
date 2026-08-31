@@ -60,6 +60,17 @@ class Settings(BaseSettings):
                                description="Backpressure: drop oldest message if queue is full"
                                            "Must be >= 2x the number of INDI properties")
 
+    # --- External notifications (offline) ---
+    # Programs watching the session can send a UDP datagram that the bridge
+    # republishes on /ws/state, so clients see it with no internet at all.
+    # The bind is on loopback because the normal case is a sender on the
+    # same machine (KStars, PHD2 and their monitors all run on the Pi): no
+    # port is exposed to the network unless explicitly asked for. To receive
+    # from other machines on the LAN, set 0.0.0.0.
+    notify_udp_enabled: bool = Field(default=True)
+    notify_udp_host: str = Field(default="127.0.0.1")
+    notify_udp_port: int = Field(default=5005, ge=1, le=65535)
+
     # --- Misc ---
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 

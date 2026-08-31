@@ -49,6 +49,7 @@ async def state_ws_endpoint(ws: WebSocket, hub: WsHub, state: StateManager) -> N
             "phd2": snap.get("phd2", {}),
             "last_frame": snap.get("last_frame", {}),
             "messages": snap.get("messages", []),
+            "notifications": snap.get("notifications", []),
             "properties_count": len(properties),
         }))
         # Yield ogni 16 messaggi per dare modo al writer_loop di drenare
