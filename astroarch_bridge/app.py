@@ -41,6 +41,17 @@ from .ws.state_stream import make_state_listener, state_ws_endpoint
 
 log = logging.getLogger(__name__)
 
+# Non-standard response headers the bridge uses for image metadata. A
+# browser hides them from JavaScript unless they are listed in
+# Access-Control-Expose-Headers, so a cross-origin web client could not
+# read HFR, dimensions or the map centre coordinates.
+# Emitted by routes/system.py::last_frame and routes/skymap.py::view.
+CORS_EXPOSE_HEADERS = (
+    "X-ts", "X-width", "X-height", "X-hfr", "X-stars", "X-filter",
+    "X-exposure", "X-frame_type", "X-object",
+    "X-Center-RA-Deg", "X-Center-Dec-Deg", "X-FOV-Deg",
+)
+
 
 def create_app() -> FastAPI:
     settings = get_settings()
@@ -146,12 +157,20 @@ def create_app() -> FastAPI:
     app.state.bridge = bridge
 
     if settings.cors_origins:
+        # allow_credentials may be enabled ONLY with an explicit list of
+        # origins: the CORS spec forbids combining it with "*", and the
+        # browser discards the response when Access-Control-Allow-Origin is
+        # "*" and the request is credentialed. The bridge authenticates with
+        # a bearer token in a header, not with cookies, so it does not need
+        # credentials at all.
+        allow_all_origins = "*" in settings.cors_origins
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.cors_origins,
-            allow_credentials=True,
+            allow_credentials=not allow_all_origins,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=list(CORS_EXPOSE_HEADERS),
         )
 
     # Healthcheck (no auth)
