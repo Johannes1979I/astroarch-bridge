@@ -35,6 +35,7 @@ from .routes import (
     system,
 )
 from .state import StateManager
+from .webui import mount_web_ui
 from .ws.frame_stream import frame_ws_endpoint, make_frame_listener
 from .ws.hub import WsHub
 from .ws.state_stream import make_state_listener, state_ws_endpoint
@@ -170,6 +171,7 @@ def create_app() -> FastAPI:
         app.include_router(r)
 
     # WebSocket endpoints
+    # (registered before the static mount: the catch-all on '/' goes last)
     @app.websocket("/ws/state")
     async def _ws_state(ws: WebSocket):
         await state_ws_endpoint(ws, state_hub, state)
@@ -177,5 +179,9 @@ def create_app() -> FastAPI:
     @app.websocket("/ws/frames")
     async def _ws_frames(ws: WebSocket):
         await frame_ws_endpoint(ws, frames_hub)
+
+    # Optional web UI, mounted last so that /api, /ws and /healthz keep
+    # winning over the catch-all.
+    mount_web_ui(app, settings.web_dir)
 
     return app

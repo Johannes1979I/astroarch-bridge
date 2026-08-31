@@ -202,6 +202,35 @@ Bearer <token>`.
 
 ---
 
+## Serving a web UI (optional)
+
+The bridge can serve a pre-built web interface from the same origin as
+its own API. Point `ASTROARCH_WEB_DIR` at a folder containing an
+`index.html` and it is mounted at `/`; if the folder is absent nothing
+is mounted and the bridge behaves exactly as before.
+
+```bash
+ASTROARCH_WEB_DIR=/usr/share/astroarch-bridge/web astroarch-bridge
+# then, from any device on the same network:
+#   http://astroarch.local:8765/
+```
+
+Same-origin is the point, not a convenience. A page served over HTTPS
+from anywhere else cannot call `http://astroarch.local:8765` at all —
+browsers block mixed content with no workaround available to the page.
+Serving the UI from the bridge sidesteps both that and CORS, and needs
+no certificate, which matters in the field where there is no internet
+to obtain or renew one.
+
+The mount is registered last, so `/api`, `/ws` and `/healthz` keep
+precedence over it. Unknown paths fall back to `index.html` so that
+client-side routes survive a reload, except under those reserved
+prefixes and for paths that look like files — a missing `main.dart.js`
+stays an honest 404 rather than becoming HTML that the browser would
+report as a baffling syntax error.
+
+---
+
 ## Tech stack
 
 | | |

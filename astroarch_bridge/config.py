@@ -60,6 +60,14 @@ class Settings(BaseSettings):
                                description="Backpressure: drop oldest message if queue is full"
                                            "Must be >= 2x the number of INDI properties")
 
+    # --- Web UI ---
+    # Folder holding an already-built web interface (a Flutter web build,
+    # or any other SPA). If it does not exist the bridge mounts nothing and
+    # behaves exactly as before: the UI is optional, not a requirement.
+    # Serving it from the bridge puts it on the same origin as the API,
+    # which avoids CORS and the browser's mixed-content block.
+    web_dir: Path = Field(default=Path("/usr/share/astroarch-bridge/web"))
+
     # --- Misc ---
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 
