@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
+from ..dbus_session import with_session_bus
 
 router = APIRouter(prefix="/api/focuser", tags=["focuser"],
                     dependencies=[Depends(require_token)])
@@ -102,10 +102,7 @@ async def _run_monitor() -> None:
     Restart automatico in caso di crash."""
     while True:
         try:
-            env = os.environ.copy()
-            uid = os.getuid()
-            env.setdefault("DBUS_SESSION_BUS_ADDRESS",
-                           f"unix:path=/run/user/{uid}/bus")
+            env = with_session_bus()
             proc = await asyncio.create_subprocess_exec(
                 "dbus-monitor", "--session",
                 "type='signal',interface='org.kde.kstars.Ekos.Focus'",
@@ -231,9 +228,7 @@ async def ekos_state(train: str = "") -> dict:
         "org.kde.kstars.Ekos.Focus.status", train,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "DBUS_SESSION_BUS_ADDRESS":
-             os.environ.get("DBUS_SESSION_BUS_ADDRESS",
-                            f"unix:path=/run/user/{os.getuid()}/bus")},
+        env=with_session_bus(),
     )
     try:
         sout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
+from ..dbus_session import with_session_bus
 from ..deps import Bridge, get_bridge
 from ._roles import resolve_device
 
@@ -341,10 +342,8 @@ async def _dbus_get_property(path: str, prop: str) -> str:
 
 async def _dbus_call_literal(path: str, method: str, *args: str) -> str:
     """Chiamata DBus con --literal output (per array/varianti)."""
-    import os, asyncio
-    env = os.environ.copy()
-    uid = os.getuid()
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    import asyncio
+    env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", "--literal",
         "org.kde.kstars", path, method, *args,
