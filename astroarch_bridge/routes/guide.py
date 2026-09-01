@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
@@ -12,6 +13,24 @@ from ..phd2.client import Phd2RpcError
 
 router = APIRouter(prefix="/api/guide", tags=["guide"], dependencies=[Depends(require_token)])
 _logger = logging.getLogger("astroarch_bridge.guide")
+
+# --- Guider INTERNO di Ekos (v0.3.19) -----------------------------------
+# Oltre a PHD2, l'app può pilotare il guider interno di Ekos via DBus
+# (org.kde.kstars.Ekos.Guide). Serve per: (a) utenti che guidano con il
+# guider interno invece di PHD2; (b) abilitare in futuro l'AI guiding/GPG,
+# che vivono nel guider interno. Tutto ADDITIVO: non tocca il flusso PHD2.
+_EKOS_SERVICE = "org.kde.kstars"
+_EKOS_GUIDE_PATH = "/KStars/Ekos/Guide"
+_EKOS_GUIDE_IFACE = "org.kde.kstars.Ekos.Guide"
+# Mappa best-effort Ekos::GuideState (indice enum) → etichetta. Da rifinire
+# sul Pi: qdbus può ritornare il nome o il numero, gestiamo entrambi.
+_EKOS_GUIDE_STATES = {
+    0: "IDLE", 1: "ABORTED", 2: "CONNECTED", 3: "DISCONNECTED",
+    4: "CAPTURE", 5: "LOOPING", 6: "STAR_SELECT", 7: "CALIBRATING",
+    8: "CALIBRATION_ERROR", 9: "CALIBRATION_SUCCESS", 10: "GUIDING",
+    11: "MANUAL_DITHERING", 12: "DITHERING", 13: "DITHERING_SETTLE",
+    14: "DITHERING_ERROR", 15: "DITHERING_SUCCESS", 16: "SUSPENDED",
+}
 
 
 def _phd2_http_error(op: str, e: BaseException) -> HTTPException:
@@ -355,6 +374,147 @@ async def star_image(
                                  "X-Frame": str(payload["frame"] or "")})
     payload["png_base64"] = base64.b64encode(png_bytes).decode("ascii")
     return payload
+
+
+# ============================================================================
+# v0.3.19: GUIDER INTERNO di Ekos (via DBus qdbus6). Additivo — il flusso
+# PHD2 sopra resta invariato. Endpoint sotto il prefisso /api/guide/ekos_*.
+# ============================================================================
+
+async def _qdbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
+    """qdbus6 → (returncode, stdout). Copia locale isolata (non dipende da
+    altri route module) per pilotare org.kde.kstars.Ekos.Guide."""
+    env = os.environ.copy()
+    uid = os.getuid()
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    proc = await asyncio.create_subprocess_exec(
+        "qdbus6", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, "timeout"
+    return proc.returncode, stdout.decode("utf-8", "replace").strip()
+
+
+async def _guide_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[int, str]:
+    return await _qdbus_call(_EKOS_SERVICE, _EKOS_GUIDE_PATH,
+                             f"{_EKOS_GUIDE_IFACE}.{method}", *args, timeout=timeout)
+
+
+def _read_guider_type() -> "int | None":
+    """GuiderType da kstarsrc [Guide]: 0=internal, 1=PHD2, 2=LinGuider.
+    None se assente. Read-only, non modifica nulla."""
+    from pathlib import Path
+    cfg = Path.home() / ".config/kstarsrc"
+    if not cfg.exists():
+        return None
+    try:
+        in_guide = False
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            t = line.strip()
+            if t.startswith("[") and t.endswith("]"):
+                in_guide = (t == "[Guide]")
+                continue
+            if in_guide and t.startswith("GuiderType="):
+                try:
+                    return int(t.split("=", 1)[1])
+                except ValueError:
+                    return None
+    except Exception as e:
+        _logger.warning("cannot read GuiderType: %s", e)
+    return None
+
+
+def _parse_float_list(raw: str) -> "list[float]":
+    out: list[float] = []
+    for tok in raw.replace(",", " ").split():
+        try:
+            out.append(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+@router.get("/backend")
+async def guide_backend() -> dict:
+    """Quale guider usa Ekos: 'internal' | 'phd2' | 'linguider' | None.
+    L'app lo legge per adattare la UI (pannello PHD2 vs guider interno)."""
+    gt = _read_guider_type()
+    name = {0: "internal", 1: "phd2", 2: "linguider"}.get(gt)
+    return {"backend": name, "guider_type": gt}
+
+
+@router.get("/ekos_status")
+async def guide_ekos_status() -> dict:
+    """Stato del guider INTERNO di Ekos via DBus: stato + RMS RA/DEC (arcsec)."""
+    out: dict = {"state_raw": None, "state": None,
+                 "rms_ra": None, "rms_dec": None, "rms_total": None,
+                 "delta_ra": None, "delta_dec": None}
+    rc, val = await _guide_dbus("status", timeout=6.0)
+    if rc == 0 and val.strip():
+        v = val.strip()
+        out["state_raw"] = v
+        out["state"] = _EKOS_GUIDE_STATES.get(int(v), v) if v.lstrip("-").isdigit() else v
+    rc, val = await _guide_dbus("axisSigma", timeout=6.0)
+    if rc == 0:
+        nums = _parse_float_list(val)
+        if len(nums) >= 2:
+            out["rms_ra"], out["rms_dec"] = nums[0], nums[1]
+            out["rms_total"] = round((nums[0] ** 2 + nums[1] ** 2) ** 0.5, 3)
+    rc, val = await _guide_dbus("axisDelta", timeout=6.0)
+    if rc == 0:
+        nums = _parse_float_list(val)
+        if len(nums) >= 2:
+            out["delta_ra"], out["delta_dec"] = nums[0], nums[1]
+    return out
+
+
+@router.post("/ekos_start")
+async def guide_ekos_start() -> dict:
+    """Avvia l'autoguiding col guider interno di Ekos (guide())."""
+    rc, out = await _guide_dbus("guide", timeout=15.0)
+    if rc != 0:
+        raise HTTPException(status_code=502, detail=f"Ekos.Guide.guide fallito: {out}")
+    return {"ok": True, "raw": out}
+
+
+@router.post("/ekos_stop")
+async def guide_ekos_stop() -> dict:
+    """Ferma calibrazione/guiding/dithering (abort())."""
+    rc, out = await _guide_dbus("abort", timeout=10.0)
+    return {"ok": rc == 0, "raw": out}
+
+
+@router.post("/ekos_calibrate")
+async def guide_ekos_calibrate() -> dict:
+    """Ricalibra il guider interno: clearCalibration() → calibrate()."""
+    await _guide_dbus("clearCalibration", timeout=10.0)
+    await asyncio.sleep(0.4)
+    rc, out = await _guide_dbus("calibrate", timeout=15.0)
+    if rc != 0:
+        raise HTTPException(status_code=502, detail=f"Ekos.Guide.calibrate fallito: {out}")
+    return {"ok": True, "raw": out}
+
+
+@router.post("/ekos_dither")
+async def guide_ekos_dither() -> dict:
+    """Dither immediato in direzione casuale (dither())."""
+    rc, out = await _guide_dbus("dither", timeout=10.0)
+    if rc != 0:
+        raise HTTPException(status_code=502, detail=f"Ekos.Guide.dither fallito: {out}")
+    return {"ok": True, "raw": out}
+
+
+@router.post("/ekos_loop")
+async def guide_ekos_loop() -> dict:
+    """Loop continuo dei frame di guida (loop()), utile per framing/star select."""
+    rc, out = await _guide_dbus("loop", timeout=10.0)
+    return {"ok": rc == 0, "raw": out}
 
 
 # v0.3.3: endpoint full-frame.
