@@ -25,7 +25,7 @@ wheels = [
 
 [[package]]
 name = "astroarch-bridge"
-version = "0.3.19"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "astropy" },
