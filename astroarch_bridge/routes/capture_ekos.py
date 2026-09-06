@@ -16,6 +16,7 @@ from xml.sax.saxutils import escape
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
+from ..dbus_session import with_session_bus
 from ..config import get_settings
 from ..deps import Bridge, get_bridge
 
@@ -355,10 +356,7 @@ async def _auto_dither_worker() -> None:
     Restart automatico in caso di crash di dbus-monitor."""
     while _auto_dither_state["enabled"]:
         try:
-            env = os.environ.copy()
-            uid = os.getuid()
-            env.setdefault("DBUS_SESSION_BUS_ADDRESS",
-                           f"unix:path=/run/user/{uid}/bus")
+            env = with_session_bus()
             proc = await asyncio.create_subprocess_exec(
                 "dbus-monitor", "--session",
                 "type='signal',interface='org.kde.kstars.Ekos.Capture',member='captureComplete'",
@@ -633,9 +631,7 @@ async def _stop_capture_preview() -> None:
 
 async def _dbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     """Esegue qdbus6 e ritorna (returncode, stdout)."""
-    env = os.environ.copy()
-    uid = os.getuid()
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", *args,
         stdout=asyncio.subprocess.PIPE,

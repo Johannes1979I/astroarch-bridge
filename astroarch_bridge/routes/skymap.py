@@ -33,6 +33,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import Response
 
 from ..auth import require_token
+from ..dbus_session import with_session_bus
 
 router = APIRouter(prefix="/api/skymap", tags=["skymap"],
                    dependencies=[Depends(require_token)])
@@ -46,9 +47,7 @@ _EXPORT_PATH = "/tmp/astroarch_bridge_skymap.png"
 async def _kstars_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[int, str]:
     """Esegue qdbus6 verso KStars con il DBUS_SESSION_BUS_ADDRESS giusto
     (la sessione utente grafica). Ritorna (returncode, stdout)."""
-    env = os.environ.copy()
-    uid = os.getuid()
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", KSTARS_SERVICE, KSTARS_PATH, method, *args,
         stdout=asyncio.subprocess.PIPE,
