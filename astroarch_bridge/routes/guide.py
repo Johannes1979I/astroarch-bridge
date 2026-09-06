@@ -547,23 +547,27 @@ async def guide_ekos_loop() -> dict:
 
 
 @router.get("/ekos_full_frame")
-async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024) -> dict:
-    """Frame completo della camera di guida quando si usa il GUIDER INTERNO.
+async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024,
+                                timeout: float = 20.0) -> dict:
+    """Frame LIVE della camera di guida quando si usa il GUIDER INTERNO.
 
-    Parita' con /full_frame (PHD2) ma senza PHD2: leggiamo il nome della
-    camera di guida da Ekos.Guide.camera, prendiamo l'ultimo BLOB FITS di
-    quel device via INDI.getBLOBFile, lo stretchiamo (STF stile PI) e
-    ritorniamo PNG. Richiede che la camera stia loopando/guidando (altrimenti
-    nessun frame recente disponibile).
+    Parita' con /full_frame (PHD2) ma senza PHD2: apriamo un client INDI
+    dedicato su :7624 e ci iscriviamo allo stream BLOB della camera di guida
+    (la modalita' BLOB e' per-client, quindi Ekos continua a guidare
+    indisturbato). Il FITS ricevuto viene stretchato (STF stile PI) e servito
+    come PNG.
+
+    Richiede che la camera stia esponendo (LOOP o guiding attivo): altrimenti
+    non c'e' nessun frame da ricevere e rispondiamo 409.
     """
     import base64
     import io
-    import os
     import numpy as np
     from fastapi.responses import Response
-    from ..images.processor import _percentile_stretch
+    from ..images.processor import _percentile_stretch, _read_fits_bytes
+    from ..indi_blob import grab_blob
 
-    # 1. nome camera di guida
+    # 1. nome della camera di guida (dal modulo Guide di Ekos)
     rc, cam = await _guide_dbus("camera", timeout=6.0)
     cam = (cam or "").strip()
     if rc != 0 or not cam:
@@ -571,22 +575,31 @@ async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024) -> dict:
             detail="Camera di guida non disponibile. Avvia Ekos e imposta il "
                    "guider interno con una camera di guida.")
 
-    # 2. path del FITS dell'ultimo BLOB (property/element 'CCD1' per una CCD INDI)
-    rc, out = await _indi_dbus("getBLOBFile", cam, "CCD1", "CCD1", timeout=8.0)
-    fits_path = (out.splitlines()[0].strip() if out else "")
-    if rc != 0 or not fits_path or not os.path.exists(fits_path):
-        raise HTTPException(status_code=409,
-            detail="Nessun frame recente dalla camera di guida. Avvia il loop "
-                   "o la guida (pulsante LOOP/START) e riprova.")
-
-    # 3. FITS -> stretch -> PNG (stesso flusso di /full_frame)
+    # 2. prossimo frame dallo stream BLOB INDI
     try:
-        from astropy.io import fits  # type: ignore
-        with fits.open(fits_path, memmap=False) as hdul:
-            data = np.asarray(hdul[0].data, dtype=np.float64)
+        raw = await grab_blob(cam, timeout=max(3.0, min(timeout, 60.0)))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=409,
+            detail=f"Nessun frame da '{cam}' entro il timeout. Avvia il LOOP "
+                   "o la guida e riprova.")
+    except ConnectionError as e:
+        raise HTTPException(status_code=503,
+            detail=f"Server INDI non raggiungibile: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FITS read error: {e}")
+        _logger.exception("grab_blob fallito")
+        raise HTTPException(status_code=500,
+            detail=f"Errore lettura frame INDI: {type(e).__name__}: {e}")
 
+    # 3. FITS (bytes) -> stretch -> PNG
+    try:
+        data, _hdr = _read_fits_bytes(raw)
+        data = np.asarray(data, dtype=np.float64)
+    except Exception as e:
+        raise HTTPException(status_code=502,
+            detail=f"Frame ricevuto ma non leggibile come FITS: {e}")
+
+    if data.ndim == 3:  # eventuale RGB: prendi la luminanza del primo piano
+        data = data[0]
     if data.ndim != 2:
         raise HTTPException(status_code=502,
             detail=f"FITS shape inattesa: {data.shape} (atteso 2D)")
