@@ -56,6 +56,13 @@ class StateManager:
         self._phd2_live: dict[str, Any] = {}
         self._connections = ConnectionsView()
         self._last_frame_meta: dict[str, Any] = {}
+        # Ultimo frame RAW della camera di GUIDA (FITS non processato) +
+        # timestamp. Il bridge lo riceve gia' via enableBLOB durante il loop:
+        # tenerlo in cache permette a /api/guide/ekos_full_frame di rispondere
+        # subito, invece di aprire una nuova connessione INDI e attendere il
+        # frame successivo. Non viene processato finche' nessuno lo chiede.
+        self._last_guide_blob: bytes | None = None
+        self._last_guide_blob_ts: float = 0.0
         # v0.3.15: conserva l'ultimo JPEG in RAM così l'app può recuperarlo
         # via REST (es. al rientro da background, quando la WS /ws/frames si è
         # riconnessa ma il bridge non re-invia l'ultimo frame già broadcastato).
@@ -203,6 +210,10 @@ class StateManager:
             gcam = await guide_camera()
             if gcam and device.strip() == gcam.strip():
                 self._last_blob_ts = time.monotonic()
+                # conserva il RAW (nessun costo di elaborazione): serve alla
+                # pagina Guida dell'app, che lo chiede on-demand
+                self._last_guide_blob = blob
+                self._last_guide_blob_ts = time.monotonic()
                 return
         except Exception:
             pass  # se Ekos non risponde, meglio mostrare il frame che perderlo
@@ -224,6 +235,17 @@ class StateManager:
             "source": "blob",
         }
         await self.handle_frame(meta["path"], result.jpeg, result.thumbnail, meta)
+
+    def take_guide_blob(self, max_age: float = 15.0) -> bytes | None:
+        """Ultimo frame FITS della camera di guida, se abbastanza recente.
+
+        Usato da /api/guide/ekos_full_frame: evita di aprire una connessione
+        INDI dedicata e di attendere la posa successiva."""
+        if self._last_guide_blob is None:
+            return None
+        if (time.monotonic() - self._last_guide_blob_ts) > max_age:
+            return None
+        return self._last_guide_blob
 
     def seconds_since_last_blob(self) -> float:
         """Secondi dall'ultimo BLOB camera ricevuto via INDI (grande se mai)."""

@@ -548,7 +548,8 @@ async def guide_ekos_loop() -> dict:
 
 @router.get("/ekos_full_frame")
 async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024,
-                                timeout: float = 20.0) -> dict:
+                                timeout: float = 20.0,
+                                bridge: Bridge = Depends(get_bridge)) -> dict:
     """Frame LIVE della camera di guida quando si usa il GUIDER INTERNO.
 
     Parita' con /full_frame (PHD2) ma senza PHD2: apriamo un client INDI
@@ -575,9 +576,19 @@ async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024,
             detail="Camera di guida non disponibile. Avvia Ekos e imposta il "
                    "guider interno con una camera di guida.")
 
-    # 2. prossimo frame dallo stream BLOB INDI
+    # 2. frame: prima la cache (il bridge riceve gia' i BLOB della guida
+    #    durante il loop, quindi di norma rispondiamo all'istante), altrimenti
+    #    apriamo una connessione INDI dedicata e attendiamo la prossima posa.
+    raw = None
     try:
-        raw = await grab_blob(cam, timeout=max(3.0, min(timeout, 60.0)))
+        raw = bridge.state.take_guide_blob()
+    except Exception:
+        raw = None
+    if raw is not None:
+        _logger.debug("ekos_full_frame: servito dalla cache (%d byte)", len(raw))
+    try:
+        if raw is None:
+            raw = await grab_blob(cam, timeout=max(3.0, min(timeout, 60.0)))
     except asyncio.TimeoutError:
         raise HTTPException(status_code=409,
             detail=f"Nessun frame da '{cam}' entro il timeout. Avvia il LOOP "
@@ -590,40 +601,52 @@ async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024,
         raise HTTPException(status_code=500,
             detail=f"Errore lettura frame INDI: {type(e).__name__}: {e}")
 
-    # 3. FITS (bytes) -> stretch -> PNG
+    # 3. FITS (bytes) -> stretch -> JPEG
+    # Ottimizzato per il refresh continuo su Tailscale (prima ~4s a frame):
+    #  - float32 invece di float64 (meta' memoria/banda CPU)
+    #  - DECIMAZIONE prima dello stretch: lo stretch percentile a piena
+    #    risoluzione era il costo dominante sul Pi
+    #  - resta in scala di grigi (niente convert RGB: triplicava i dati per
+    #    un'immagine monocromatica)
+    #  - JPEG invece di PNG: un campo stellare rumoroso non si comprime in
+    #    PNG, il JPEG e' ~10x piu' leggero da trasferire
     try:
         data, _hdr = _read_fits_bytes(raw)
-        data = np.asarray(data, dtype=np.float64)
+        data = np.asarray(data, dtype=np.float32)
     except Exception as e:
         raise HTTPException(status_code=502,
             detail=f"Frame ricevuto ma non leggibile come FITS: {e}")
 
-    if data.ndim == 3:  # eventuale RGB: prendi la luminanza del primo piano
+    if data.ndim == 3:  # eventuale RGB: prendi il primo piano
         data = data[0]
     if data.ndim != 2:
         raise HTTPException(status_code=502,
             detail=f"FITS shape inattesa: {data.shape} (atteso 2D)")
 
     h, w = data.shape
+    if max_dim > 0 and max(w, h) > max_dim:
+        step = int(np.ceil(max(w, h) / float(max_dim)))
+        if step > 1:
+            data = data[::step, ::step]
+            h, w = data.shape
+
     stretched = _percentile_stretch(data)
     from PIL import Image
     img = Image.fromarray(stretched, mode="L")
-    if max_dim > 0 and (w > max_dim or h > max_dim):
-        scale = max_dim / max(w, h)
-        w2, h2 = int(w * scale), int(h * scale)
-        img = img.resize((w2, h2), Image.LANCZOS)
-        w, h = w2, h2
-    img = img.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    png_bytes = buf.getvalue()
+    img.save(buf, format="JPEG", quality=72, optimize=True)
+    img_bytes = buf.getvalue()
 
-    if fmt.lower() == "png":
-        return Response(content=png_bytes, media_type="image/png",
+    if fmt.lower() in ("png", "jpeg", "jpg", "binary"):
+        return Response(content=img_bytes, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store",
                                  "X-Width": str(w), "X-Height": str(h)})
-    return {"width": w, "height": h, "camera": cam,
-            "png_base64": base64.b64encode(png_bytes).decode("ascii")}
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    # `png_base64` resta per compatibilita' con le app gia' installate:
+    # Image.memory riconosce il formato dai byte, non dal nome del campo.
+    return {"width": w, "height": h, "camera": cam, "format": "jpeg",
+            "bytes": len(img_bytes),
+            "png_base64": b64, "image_base64": b64}
 
 
 # v0.3.3: endpoint full-frame.
