@@ -22,14 +22,18 @@ _logger = logging.getLogger("astroarch_bridge.guide")
 _EKOS_SERVICE = "org.kde.kstars"
 _EKOS_GUIDE_PATH = "/KStars/Ekos/Guide"
 _EKOS_GUIDE_IFACE = "org.kde.kstars.Ekos.Guide"
-# Mappa best-effort Ekos::GuideState (indice enum) → etichetta. Da rifinire
-# sul Pi: qdbus può ritornare il nome o il numero, gestiamo entrambi.
+# Ekos::GuideState (ekos.h di KStars), ordine ESATTO dell'enum.
+# NB: la versione precedente era scritta a stima e ometteva GUIDE_DARK,
+# GUIDE_SUBFRAME e GUIDE_REACQUIRE: da indice 6 in poi tutto slittava di 3,
+# cosi' lo stato 12 (che e' GUIDING) veniva mostrato in app come "DITHERING".
+# Verificato sul Pi contro Ekos.Guide.status durante una guida reale.
 _EKOS_GUIDE_STATES = {
     0: "IDLE", 1: "ABORTED", 2: "CONNECTED", 3: "DISCONNECTED",
-    4: "CAPTURE", 5: "LOOPING", 6: "STAR_SELECT", 7: "CALIBRATING",
-    8: "CALIBRATION_ERROR", 9: "CALIBRATION_SUCCESS", 10: "GUIDING",
-    11: "MANUAL_DITHERING", 12: "DITHERING", 13: "DITHERING_SETTLE",
-    14: "DITHERING_ERROR", 15: "DITHERING_SUCCESS", 16: "SUSPENDED",
+    4: "CAPTURE", 5: "LOOPING", 6: "DARK", 7: "SUBFRAME",
+    8: "STAR_SELECT", 9: "CALIBRATING", 10: "CALIBRATION_ERROR",
+    11: "CALIBRATION_SUCCESS", 12: "GUIDING", 13: "SUSPENDED",
+    14: "REACQUIRE", 15: "MANUAL_DITHERING", 16: "DITHERING",
+    17: "DITHERING_SETTLE", 18: "DITHERING_ERROR", 19: "DITHERING_SUCCESS",
 }
 
 
