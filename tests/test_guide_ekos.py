@@ -57,7 +57,10 @@ async def test_ekos_status_asks_for_literal_output_and_parses_rms(monkeypatch):
         calls.append(args)
         method = args[-1]
         if method.endswith(".status"):
-            return 0, "10"
+            # 12 = GUIDING in Ekos::GuideState (ekos.h). Not 10, which is
+            # CALIBRATION_ERROR: the wrong table used to make the app show
+            # DITHERING while the mount was quietly guiding.
+            return 0, "12"
         if method.endswith(".axisSigma"):
             return 0, "[Variant: [Argument: ad {0.8, 0.6}]]"
         if method.endswith(".axisDelta"):
@@ -80,3 +83,23 @@ async def test_ekos_status_asks_for_literal_output_and_parses_rms(monkeypatch):
             assert "--literal" in args
         if args[-1].endswith(".status"):
             assert "--literal" not in args
+
+
+def test_guide_state_table_matches_ekos_h():
+    """The GuideState numbering, as declared in KStars ekos.h.
+
+    Three states (DARK, SUBFRAME, REACQUIRE) were missing from an earlier
+    version of this table, shifting everything from index 6 onwards: the app
+    reported DITHERING for a mount that was simply guiding. Pinned here so
+    the shift cannot come back unnoticed.
+    """
+    t = guide._EKOS_GUIDE_STATES
+    assert t[0] == "IDLE"
+    assert t[6] == "DARK"
+    assert t[7] == "SUBFRAME"
+    assert t[9] == "CALIBRATING"
+    assert t[10] == "CALIBRATION_ERROR"
+    assert t[12] == "GUIDING"
+    assert t[14] == "REACQUIRE"
+    assert t[16] == "DITHERING"
+    assert len(t) == 20
