@@ -69,9 +69,26 @@ async def camera_roles(bridge: Bridge = Depends(get_bridge)) -> dict:
     guide: str | None = None
     method = "none"
 
+    # Step 0: Ekos sa con certezza qual è la camera di guida (guider interno o
+    # PHD2 che sia). Piu' affidabile dell'euristica sui nomi, che non copre
+    # camere come la ToupTek GPCMOS02000KMA.
+    try:
+        from ..ekos_dbus import guide_camera
+        gcam = await guide_camera()
+        if gcam:
+            gl = gcam.strip().lower()
+            for c in cameras:
+                cl = c.lower()
+                if cl == gl or cl in gl or gl in cl:
+                    guide = c
+                    method = "ekos"
+                    break
+    except Exception:
+        pass
+
     # Step 1: PHD2 -> camera attiva è la guida
     try:
-        if bridge.phd2.state == "connected":
+        if guide is None and bridge.phd2.state == "connected":
             eq = await bridge.phd2.call("get_current_equipment", timeout=4.0)
             if isinstance(eq, dict):
                 cam_info = eq.get("camera") or {}

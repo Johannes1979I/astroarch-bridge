@@ -190,6 +190,22 @@ class StateManager:
         # Verifica che siano i primi byte di un FITS ('SIMPLE  =')
         if len(blob) < 80 or not blob.startswith(b"SIMPLE"):
             return
+        # I frame della camera di GUIDA non sono foto della sessione: non devono
+        # finire nel monitor della home (che mostra gli scatti della camera
+        # principale). L'app li mostra nella pagina Guida, on-demand, via
+        # /api/guide/ekos_full_frame. Scartiamo prima di processare: durante il
+        # loop di guida arriva un frame ogni ~0.5s e il debayer/stretch
+        # costerebbe CPU inutile sul Pi.
+        # NB: il nome arriva da Ekos (Ekos.Guide.camera), non da euristiche sui
+        # nomi — camere come la ToupTek GPCMOS02000KMA non contengono "guide".
+        try:
+            from .ekos_dbus import guide_camera
+            gcam = await guide_camera()
+            if gcam and device.strip() == gcam.strip():
+                self._last_blob_ts = time.monotonic()
+                return
+        except Exception:
+            pass  # se Ekos non risponde, meglio mostrare il frame che perderlo
         try:
             from .images.processor import process_fits_bytes_async
             result = await process_fits_bytes_async(blob)
