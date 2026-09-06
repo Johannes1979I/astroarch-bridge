@@ -403,8 +403,17 @@ async def _qdbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     return proc.returncode, stdout.decode("utf-8", "replace").strip()
 
 
-async def _guide_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[int, str]:
-    return await _qdbus_call(_EKOS_SERVICE, _EKOS_GUIDE_PATH,
+async def _guide_dbus(method: str, *args: str, timeout: float = 10.0,
+                      literal: bool = False) -> tuple[int, str]:
+    """Call a method or read a property of Ekos.Guide.
+
+    `literal` is mandatory for anything that is not a scalar type: without
+    it qdbus6 prints an error message instead of the value, **exiting with
+    status 0**, so the caller believes it got good data while it is really
+    parsing an English sentence.
+    """
+    opts = ("--literal",) if literal else ()
+    return await _qdbus_call(*opts, _EKOS_SERVICE, _EKOS_GUIDE_PATH,
                              f"{_EKOS_GUIDE_IFACE}.{method}", *args, timeout=timeout)
 
 # INDI DBus: per prendere il frame della camera di guida quando si usa il
@@ -419,9 +428,23 @@ async def _indi_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[in
                              f"{_INDI_IFACE}.{method}", *args, timeout=timeout)
 
 
+# Default declared by KStars for GuiderType (kstars.kcfg): 0 = internal
+# guider. KDE only writes the key into kstarsrc when the user changes the
+# setting, so a missing key is NOT "unknown": it is the default, and it is
+# also the commonest case of all, anyone who never touched that setting.
+_GUIDER_TYPE_DEFAULT = 0
+
+
 def _read_guider_type() -> "int | None":
-    """GuiderType da kstarsrc [Guide]: 0=internal, 1=PHD2, 2=LinGuider.
-    None se assente. Read-only, non modifica nulla."""
+    """GuiderType from kstarsrc [Guide]: 0=internal, 1=PHD2, 2=LinGuider.
+
+    When the key is missing this returns the KStars default rather than
+    None, because that is what Ekos is actually using. None stays reserved
+    for the cases where nothing can be said — no kstarsrc, or a file that
+    cannot be read.
+
+    Read-only, nothing is modified.
+    """
     from pathlib import Path
     cfg = Path.home() / ".config/kstarsrc"
     if not cfg.exists():
@@ -437,16 +460,27 @@ def _read_guider_type() -> "int | None":
                 try:
                     return int(t.split("=", 1)[1])
                 except ValueError:
-                    return None
+                    return _GUIDER_TYPE_DEFAULT
     except Exception as e:
         _logger.warning("cannot read GuiderType: %s", e)
-    # KStars omits GuiderType when it equals the default (0=internal): absent key => internal
-    return 0
+        return None
+    return _GUIDER_TYPE_DEFAULT
 
 
 def _parse_float_list(raw: str) -> "list[float]":
+    """Numbers out of a qdbus6 --literal output, e.g. '[Variant: [Argument: ad {0.42, 0.31}]]'.
+
+    The values arrive inside braces and glued to the punctuation of the
+    literal format: without isolating them, a naive split yields tokens
+    like '{0.42' that do not convert, and the list comes back empty with
+    nobody noticing. Same approach `align.py::_parse_dbus_array` already
+    takes.
+    """
+    import re
+    m = re.search(r"\{([^}]*)\}", raw)
+    body = m.group(1) if m else raw
     out: list[float] = []
-    for tok in raw.replace(",", " ").split():
+    for tok in body.replace(",", " ").split():
         try:
             out.append(float(tok))
         except ValueError:
@@ -475,13 +509,16 @@ async def guide_ekos_status() -> dict:
         v = val.strip()
         out["state_raw"] = v
         out["state"] = _EKOS_GUIDE_STATES.get(int(v), v) if v.lstrip("-").isdigit() else v
-    rc, val = await _guide_dbus("axisSigma", timeout=6.0)
+    # axisSigma and axisDelta are arrays of double ('ad'): they must be
+    # read with --literal, or qdbus6 prints "I don't know how to display an
+    # argument of type 'ad'" and returns 0 all the same.
+    rc, val = await _guide_dbus("axisSigma", timeout=6.0, literal=True)
     if rc == 0:
         nums = _parse_float_list(val)
         if len(nums) >= 2:
             out["rms_ra"], out["rms_dec"] = nums[0], nums[1]
             out["rms_total"] = round((nums[0] ** 2 + nums[1] ** 2) ** 0.5, 3)
-    rc, val = await _guide_dbus("axisDelta", timeout=6.0)
+    rc, val = await _guide_dbus("axisDelta", timeout=6.0, literal=True)
     if rc == 0:
         nums = _parse_float_list(val)
         if len(nums) >= 2:
