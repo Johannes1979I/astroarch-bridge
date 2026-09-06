@@ -427,7 +427,8 @@ def _read_guider_type() -> "int | None":
                     return None
     except Exception as e:
         _logger.warning("cannot read GuiderType: %s", e)
-    return None
+    # KStars omits GuiderType when it equals the default (0=internal): absent key => internal
+    return 0
 
 
 def _parse_float_list(raw: str) -> "list[float]":
