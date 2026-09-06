@@ -29,10 +29,11 @@ from .images.watcher import FitsWatcher
 from .indi.client import IndiClient
 from .indi.protocol import IndiEvent
 from .phd2.client import Phd2Client
+from .notify.listener import UdpNotifyListener
 from .routes import (
     align, camera, capture_ekos, files, filter_wheel, focuser, focuser_ekos,
-    guide, indi_panel, mount, observation, observatory, scheduler, setup, skymap,
-    system,
+    guide, indi_panel, mount, notify, observation, observatory, scheduler,
+    setup, skymap, system,
 )
 from .state import StateManager
 from .ws.frame_stream import frame_ws_endpoint, make_frame_listener
@@ -124,6 +125,13 @@ def create_app() -> FastAPI:
         }
         await state.handle_frame(str(path), result.jpeg, result.thumbnail, meta)
 
+    # Notifications from external programs (astro_monitor & co.), offline.
+    notify_listener = UdpNotifyListener(
+        host=settings.notify_udp_host,
+        port=settings.notify_udp_port,
+        on_notification=state.handle_notification,
+    )
+
     watcher = FitsWatcher(
         images_dir=settings.images_dir,
         on_result=_on_frame,
@@ -140,10 +148,13 @@ def create_app() -> FastAPI:
         if settings.phd2_enabled:
             await phd2.start()
         await watcher.start()
+        if settings.notify_udp_enabled:
+            await notify_listener.start()
         try:
             yield
         finally:
             log.info("astroarch-bridge shutting down")
+            await notify_listener.stop()
             await watcher.stop()
             if settings.phd2_enabled:
                 await phd2.stop()
@@ -182,7 +193,7 @@ def create_app() -> FastAPI:
     # REST routers
     for r in (system.router, indi_panel.router, mount.router, camera.router,
               focuser.router, focuser_ekos.router,
-              filter_wheel.router, guide.router,
+              filter_wheel.router, guide.router, notify.router,
               observatory.router, files.router, align.router,
               scheduler.router, setup.router, capture_ekos.router,
               observation.router, skymap.router):
