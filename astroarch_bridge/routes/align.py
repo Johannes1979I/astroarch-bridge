@@ -551,6 +551,91 @@ async def ekos_align_status() -> dict:
     }
 
 
+# Ekos::AlignState values in which the module is already working: on
+# their own they explain the refusal. The other values (0 idle, 1 complete,
+# 2 failed, 3 aborted) add nothing to the message.
+#
+# The numbering is verified on KStars 3.8.3: sampling `status` during a
+# real capture-and-solve reads 4 for the whole run and 1 the moment the
+# solution lands. Do not trust the "intuitive" order: complete comes
+# before progress.
+_ALIGN_BUSY_STATES = {
+    4: "capturing or solving", 5: "syncing",
+    6: "slewing", 7: "rotating", 8: "suspended",
+}
+
+
+async def _capture_and_solve_refusal(raw: str) -> tuple[int, str]:
+    """Why Ekos refused `captureAndSolve`, in readable words.
+
+    `captureAndSolve` answers nothing but `false` and, for several of its
+    preconditions, does not even append a line to the module log. Whoever
+    is standing at the telescope is left with "captureAndSolve failed:
+    false", which names neither what is missing nor where to fix it — in
+    the dark, in the field, the worst possible moment to have to guess.
+
+    The information to answer is already there, exposed by Ekos on the same
+    interface: the three checks below cover the common refusals, and the
+    last line of the module log is quoted whenever it holds anything. These
+    are all reads: no user setting is touched.
+    """
+    from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
+    align_path = "/KStars/Ekos/Align"
+    hints: list[str] = []
+
+    # First of all: is there anybody to talk to? These two DBus errors are
+    # not a refusal from Ekos, they are the absence of Ekos, and querying
+    # its properties right after would only produce more errors.
+    if "does not exist" in raw and "org.kde.kstars" in raw:
+        return 503, ("KStars is not running, or it runs in a graphical "
+                     "session other than the bridge's.")
+    if "UnknownObject" in raw or "No such object path" in raw:
+        return 503, ("The Ekos Align module does not exist yet: Ekos is not "
+                     "started, or its INDI services never came up.")
+
+    # 1. Focal length and aperture of the optical train. Ekos reports them
+    #    as -1 when the active train points at optics that are no longer in
+    #    its database: without those there is no image scale, and the solve
+    #    cannot start.
+    tele = _parse_dbus_array(
+        await _dbus_call_literal(align_path, "org.kde.kstars.Ekos.Align.telescopeInfo"))
+    if len(tele) >= 2 and (tele[0] <= 0 or tele[1] <= 0):
+        hints.append(
+            "the active optical train has no focal length and aperture "
+            f"(Ekos reports focal={tele[0]:g}, aperture={tele[1]:g}). Open "
+            "the optical trains editor in Ekos and assign an existing scope")
+
+    # 2. Camera of the Align module.
+    rc_cam, cam = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
+                                   "org.kde.kstars.Ekos.Align.camera")
+    if rc_cam == 0 and not cam.strip():
+        hints.append("the Align module has no camera selected")
+
+    # 3. The module was already busy.
+    rc_st, st = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
+                                 "org.kde.kstars.Ekos.Align.status")
+    if rc_st == 0 and st.strip().lstrip("-").isdigit():
+        busy = _ALIGN_BUSY_STATES.get(int(st.strip()))
+        if busy:
+            hints.append(f"the Align module is already {busy}")
+
+    # 4. The last log line of the module says the rest, when there is one.
+    #    Ekos returns that log newest first, so the line that matters is the
+    #    first one.
+    rc_log, log = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
+                                   "org.kde.kstars.Ekos.Align.logText")
+    if rc_log == 0:
+        lines = [ln.strip() for ln in log.splitlines() if ln.strip()]
+        if lines:
+            hints.append(f"last message from Ekos: '{lines[0]}'")
+
+    if not hints:
+        return 500, (f"Ekos refused to start capture and solve "
+                     f"(captureAndSolve answered '{raw}') without "
+                     f"giving a reason. Check the Align module in Ekos.")
+    return 422, "Ekos refused to start capture and solve: " + "; ".join(hints) + "."
+
+
 @router.post("/ekos_capture_and_solve")
 async def ekos_capture_and_solve(
     payload: dict = Body(default={}),
@@ -690,8 +775,9 @@ async def ekos_capture_and_solve(
     rc, raw = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
                                 "org.kde.kstars.Ekos.Align.captureAndSolve")
     if rc != 0 or raw.lower() == "false":
-        raise HTTPException(status_code=500,
-                            detail=f"Ekos.Align.captureAndSolve failed: {raw}")
+        status_code, detail = await _capture_and_solve_refusal(raw)
+        _logger.warning("ekos_capture_and_solve refused: %s", detail)
+        raise HTTPException(status_code=status_code, detail=detail)
     return {"ok": True, "started": True,
             "solver_action_sent": solver_action}
 
