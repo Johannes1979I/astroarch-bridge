@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     notify_udp_host: str = Field(default="127.0.0.1")
     notify_udp_port: int = Field(default=5005, ge=1, le=65535)
 
+    # --- Web UI ---
+    # Folder holding an already-built web interface (a Flutter web build,
+    # or any other SPA). If it does not exist the bridge mounts nothing and
+    # behaves exactly as before: the UI is optional, not a requirement.
+    # Serving it from the bridge puts it on the same origin as the API,
+    # which avoids CORS and the browser's mixed-content block.
+    web_dir: Path = Field(default=Path("/usr/share/astroarch-bridge/web"))
+
     # --- Misc ---
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 
