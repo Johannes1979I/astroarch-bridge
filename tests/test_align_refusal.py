@@ -19,18 +19,33 @@ def _fake_dbus(values: dict[str, str]):
     return fake
 
 
-def _fake_literal(value: str):
-    async def fake(path: str, method: str, *args: str):
-        return value
+def _fake_literal(values: dict[str, str]):
+    """Replaces align._dbus_call_literal, reading a method -> output table.
+
+    It accepts **kw because the diagnostics pass an explicit short timeout:
+    a fake with a narrower signature than the real function turns a passing
+    suite into TypeErrors the moment the caller adds a keyword.
+    """
+    async def fake(path: str, method: str, *args: str, **kw):
+        return values.get(method.rsplit(".", 1)[-1], "")
     return fake
+
+
+def _fresh_log_line(text: str) -> str:
+    """A log line stamped now, the way Ekos stamps its own."""
+    from datetime import datetime
+    return f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')} {text}"
 
 
 @pytest.fixture
 def ekos(monkeypatch):
     """A healthy Ekos: complete optical train, camera present, module idle."""
     def configure(*, telescope="[Argument: ad {580, 100, 1}]",
+                  camera_info="[Argument: ad {6248, 4176, 3.76, 3.76}]",
                   camera="CCD Simulator", status="0", log=""):
-        monkeypatch.setattr(align, "_dbus_call_literal", _fake_literal(telescope))
+        monkeypatch.setattr(align, "_dbus_call_literal", _fake_literal({
+            "telescopeInfo": telescope, "cameraInfo": camera_info,
+        }))
         monkeypatch.setattr(capture_ekos, "_dbus_call", _fake_dbus({
             "camera": camera, "status": status, "logText": log,
         }))
@@ -73,11 +88,62 @@ async def test_a_finished_alignment_is_not_reported_as_busy(ekos):
 
 async def test_the_last_ekos_log_line_is_quoted(ekos):
     # Ekos returns the log newest first.
-    ekos(log="2026-09-01T18:27 Cannot capture\n2026-09-01T17:34 WCS enabled")
+    ekos(log=_fresh_log_line("Cannot capture") + "\n"
+             + _fresh_log_line("WCS enabled"))
     status, detail = await align._capture_and_solve_refusal("false")
     assert status == 422
     assert "Cannot capture" in detail
     assert "WCS enabled" not in detail
+
+
+async def test_an_old_log_line_is_not_passed_off_as_the_reason(ekos):
+    # Ekos never clears this log: its newest line can be from a solve twenty
+    # minutes ago. Quoting it would both mislead the user and make the honest
+    # "no reason given" answer unreachable, since a running Ekos nearly
+    # always has something in the log.
+    ekos(log="2026-09-01T18:27:04 Solution coordinates: RA 05h 34m DE +22d 00m")
+    status, detail = await align._capture_and_solve_refusal("false")
+    assert status == 500
+    assert "Solution coordinates" not in detail
+
+
+async def test_a_camera_without_pixel_size_is_named(ekos):
+    # Same stale-optical-train cause as the missing focal length, and Ekos
+    # refuses it the same silent way.
+    ekos(camera_info="[Argument: ad {0, 0, -1, -1}]")
+    status, detail = await align._capture_and_solve_refusal("false")
+    assert status == 422
+    assert "pixel size" in detail
+
+
+def test_align_state_table_matches_ekos_h():
+    """Ekos::AlignState numbering, as declared in kstars/ekos/ekos.h.
+
+    ALIGN_SUCCESSFUL sits at index 5 and shifts everything after it, so the
+    plausible-looking order (syncing, slewing, suspended...) is wrong from
+    there on. Pinned so the three copies this file used to carry cannot
+    quietly disagree again.
+    """
+    t = align._ALIGN_STATES
+    assert t[4] == "progress"
+    assert t[5] == "successful"
+    assert t[6] == "syncing"
+    assert t[7] == "slewing"
+    assert t[8] == "rotating"
+    assert t[9] == "suspended"
+    assert len(t) == 10
+    # The busy subset must be a subset, and must not claim idle/complete.
+    assert set(align._ALIGN_BUSY_STATES) <= set(t)
+    assert not set(align._ALIGN_BUSY_STATES) & {0, 1, 2, 3}
+
+
+async def test_a_suspended_module_is_reported_as_suspended(ekos):
+    # 9 = ALIGN_SUSPENDED, the one state that genuinely blocks the module.
+    # The old table never reached it at all.
+    ekos(status="9")
+    status, detail = await align._capture_and_solve_refusal("false")
+    assert status == 422
+    assert "already suspended" in detail
 
 
 async def test_ekos_not_started_is_told_apart_from_a_refusal(ekos):

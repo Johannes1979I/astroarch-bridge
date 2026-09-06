@@ -101,5 +101,7 @@ def test_guide_state_table_matches_ekos_h():
     assert t[10] == "CALIBRATION_ERROR"
     assert t[12] == "GUIDING"
     assert t[14] == "REACQUIRE"
-    assert t[16] == "DITHERING"
+    assert t[15] == "DITHERING"
+    assert t[16] == "MANUAL_DITHERING"
+    assert t[19] == "DITHERING_SETTLE"
     assert len(t) == 20

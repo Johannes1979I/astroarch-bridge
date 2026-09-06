@@ -340,7 +340,8 @@ async def _dbus_get_property(path: str, prop: str) -> str:
     return raw if rc == 0 else ""
 
 
-async def _dbus_call_literal(path: str, method: str, *args: str) -> str:
+async def _dbus_call_literal(path: str, method: str, *args: str,
+                             timeout: float = 8.0) -> str:
     """Chiamata DBus con --literal output (per array/varianti)."""
     import asyncio
     env = with_session_bus()
@@ -352,13 +353,34 @@ async def _dbus_call_literal(path: str, method: str, *args: str) -> str:
         env=env,
     )
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         return ""
     if proc.returncode != 0:
         return ""
     return out.decode("utf-8", "replace").strip()
+
+
+# Ekos::AlignState, nell'ordine dichiarato da kstars/ekos/ekos.h. Copiato
+# dal sorgente, non dedotto: ALIGN_SUCCESSFUL sta in mezzo (indice 5) e
+# sposta di uno tutto quello che segue, quindi la sequenza "intuitiva"
+# syncing/slewing/suspended sbaglia da li in poi. E lo stesso errore che
+# faceva dire all'app DITHERING mentre la guida stava semplicemente
+# guidando: una sola tabella, un solo posto da correggere.
+_ALIGN_STATES = {
+    0: "idle", 1: "complete", 2: "failed", 3: "aborted", 4: "progress",
+    5: "successful", 6: "syncing", 7: "slewing", 8: "rotating",
+    9: "suspended",
+}
+
+# Stati in cui il modulo sta gia lavorando: da soli spiegano il rifiuto.
+# Gli altri (idle, complete, failed, aborted) non aggiungono nulla.
+_ALIGN_BUSY_STATES = {
+    4: "capturing or solving", 5: "finishing the previous solve",
+    6: "syncing the mount to the solution", 7: "slewing to the target",
+    8: "rotating to the position angle", 9: "suspended",
+}
 
 
 @router.get("/ekos_full_status")
@@ -375,11 +397,7 @@ async def ekos_full_status(bridge: Bridge = Depends(get_bridge)) -> dict:
     rc, raw = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
                                 "org.kde.kstars.Ekos.Align.status")
     status_int = int(raw) if rc == 0 and raw.lstrip("-").isdigit() else None
-    status_label = {
-        0: "idle", 1: "complete", 2: "failed", 3: "aborted",
-        4: "progress", 5: "syncing", 6: "slewing",
-        7: "suspended", 8: "paused", 9: "refresh",
-    }.get(status_int, "unknown")
+    status_label = _ALIGN_STATES.get(status_int, "unknown")
     out["status_int"] = status_int
     out["status"] = status_label
 
@@ -488,19 +506,15 @@ async def ekos_align_status() -> dict:
     """Stato live del modulo Ekos Align via DBus.
     Ritorna lo status enum + (se completo) il risultato del solver.
 
-    Status Ekos Align (int):
+    Status Ekos Align (int), da Ekos::AlignState in ekos.h:
       0=Idle, 1=Complete, 2=Failed, 3=Aborted, 4=Progress,
-      5=Syncing, 6=Slewing, 7=Suspended, 8=Paused, 9=Refresh
+      5=Successful, 6=Syncing, 7=Slewing, 8=Rotating, 9=Suspended
     """
     from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
     rc, raw = await _dbus_call(EKOS_DBUS_SERVICE, "/KStars/Ekos/Align",
                                 "org.kde.kstars.Ekos.Align.status")
     status_int = int(raw) if rc == 0 and raw.lstrip("-").isdigit() else None
-    status_label = {
-        0: "idle", 1: "complete", 2: "failed", 3: "aborted",
-        4: "progress", 5: "syncing", 6: "slewing",
-        7: "suspended", 8: "paused", 9: "refresh",
-    }.get(status_int, "unknown")
+    status_label = _ALIGN_STATES.get(status_int, "unknown")
 
     # Se complete, prova a leggere il risultato
     result = None
@@ -551,18 +565,28 @@ async def ekos_align_status() -> dict:
     }
 
 
-# Ekos::AlignState values in which the module is already working: on
-# their own they explain the refusal. The other values (0 idle, 1 complete,
-# 2 failed, 3 aborted) add nothing to the message.
-#
-# The numbering is verified on KStars 3.8.3: sampling `status` during a
-# real capture-and-solve reads 4 for the whole run and 1 the moment the
-# solution lands. Do not trust the "intuitive" order: complete comes
-# before progress.
-_ALIGN_BUSY_STATES = {
-    4: "capturing or solving", 5: "syncing",
-    6: "slewing", 7: "rotating", 8: "suspended",
-}
+# Ogni diagnostica e una chiamata DBus in piu' fatta mentre l'utente
+# aspetta: il client Flutter chiude la POST a 15 s, quindi con i timeout di
+# default (8 s + 10 s x3) l'utente vedrebbe un timeout invece della
+# spiegazione, cioe' peggio di prima. Cinque chiamate corte stanno dentro il
+# budget anche nel caso peggiore.
+_DIAG_TIMEOUT = 2.5
+
+# Ekos prefissa ogni riga di log con "yyyy-MM-ddThh:mm:ss".
+_LOG_FRESH_SECONDS = 60.0
+
+
+def _log_line_is_fresh(line: str, now: "float | None" = None) -> bool:
+    """True se la riga di log di Ekos e' di poco fa (quindi spiega questo
+    rifiuto e non un'operazione di venti minuti prima)."""
+    from datetime import datetime
+    import time as _time
+    try:
+        ts = datetime.strptime(line[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+    except (ValueError, TypeError):
+        # Senza timestamp non si puo' dire se e' fresca: meglio non citarla.
+        return False
+    return abs((now if now is not None else _time.time()) - ts) <= _LOG_FRESH_SECONDS
 
 
 async def _capture_and_solve_refusal(raw: str) -> tuple[int, str]:
@@ -598,35 +622,53 @@ async def _capture_and_solve_refusal(raw: str) -> tuple[int, str]:
     #    its database: without those there is no image scale, and the solve
     #    cannot start.
     tele = _parse_dbus_array(
-        await _dbus_call_literal(align_path, "org.kde.kstars.Ekos.Align.telescopeInfo"))
-    if len(tele) >= 2 and (tele[0] <= 0 or tele[1] <= 0):
+        await _dbus_call_literal(align_path, "org.kde.kstars.Ekos.Align.telescopeInfo",
+                                 timeout=_DIAG_TIMEOUT))
+    if len(tele) >= 2 and (tele[0] < 0 or tele[1] < 0):
         hints.append(
             "the active optical train has no focal length and aperture "
             f"(Ekos reports focal={tele[0]:g}, aperture={tele[1]:g}). Open "
             "the optical trains editor in Ekos and assign an existing scope")
 
-    # 2. Camera of the Align module.
+    # 2. Pixel size of the camera in the train. Same failure as above and
+    #    same cause (a train pointing at hardware Ekos no longer knows):
+    #    align_solver.cpp refuses with a popup and writes no log line.
+    cam_info = _parse_dbus_array(
+        await _dbus_call_literal(align_path, "org.kde.kstars.Ekos.Align.cameraInfo",
+                                 timeout=_DIAG_TIMEOUT))
+    if len(cam_info) >= 4 and (cam_info[2] < 0 or cam_info[3] < 0):
+        hints.append(
+            "the camera in the active optical train has no pixel size. "
+            "Open the optical trains editor in Ekos and reselect the camera")
+
+    # 3. Camera of the Align module.
     rc_cam, cam = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
-                                   "org.kde.kstars.Ekos.Align.camera")
+                                   "org.kde.kstars.Ekos.Align.camera",
+                                   timeout=_DIAG_TIMEOUT)
     if rc_cam == 0 and not cam.strip():
         hints.append("the Align module has no camera selected")
 
-    # 3. The module was already busy.
+    # 4. The module was already busy.
     rc_st, st = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
-                                 "org.kde.kstars.Ekos.Align.status")
+                                 "org.kde.kstars.Ekos.Align.status",
+                                 timeout=_DIAG_TIMEOUT)
     if rc_st == 0 and st.strip().lstrip("-").isdigit():
         busy = _ALIGN_BUSY_STATES.get(int(st.strip()))
         if busy:
             hints.append(f"the Align module is already {busy}")
 
-    # 4. The last log line of the module says the rest, when there is one.
-    #    Ekos returns that log newest first, so the line that matters is the
-    #    first one.
+    # 5. The last log line of the module says the rest — but only if it is
+    #    about now. Ekos never clears that log, so its newest line can be a
+    #    "Solution coordinates" from a solve twenty minutes ago: quoting it
+    #    unconditionally would both mislead the user and, since a running
+    #    Ekos almost always has a log, turn the honest "no reason given"
+    #    answer into dead code. Ekos returns the log newest first.
     rc_log, log = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
-                                   "org.kde.kstars.Ekos.Align.logText")
+                                   "org.kde.kstars.Ekos.Align.logText",
+                                   timeout=_DIAG_TIMEOUT)
     if rc_log == 0:
         lines = [ln.strip() for ln in log.splitlines() if ln.strip()]
-        if lines:
+        if lines and _log_line_is_fresh(lines[0]):
             hints.append(f"last message from Ekos: '{lines[0]}'")
 
     if not hints:
@@ -775,7 +817,13 @@ async def ekos_capture_and_solve(
     rc, raw = await _dbus_call(EKOS_DBUS_SERVICE, align_path,
                                 "org.kde.kstars.Ekos.Align.captureAndSolve")
     if rc != 0 or raw.lower() == "false":
-        status_code, detail = await _capture_and_solve_refusal(raw)
+        try:
+            status_code, detail = await _capture_and_solve_refusal(raw)
+        except Exception as e:
+            # La diagnostica e' un di piu': se salta, l'utente deve comunque
+            # ricevere la risposta che riceveva prima, non un 500 muto.
+            _logger.warning("diagnosi del rifiuto fallita: %s", e)
+            status_code, detail = 500, f"Ekos.Align.captureAndSolve failed: {raw}"
         _logger.warning("ekos_capture_and_solve refused: %s", detail)
         raise HTTPException(status_code=status_code, detail=detail)
     return {"ok": True, "started": True,
