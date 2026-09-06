@@ -405,6 +405,17 @@ async def _guide_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[i
     return await _qdbus_call(_EKOS_SERVICE, _EKOS_GUIDE_PATH,
                              f"{_EKOS_GUIDE_IFACE}.{method}", *args, timeout=timeout)
 
+# INDI DBus: per prendere il frame della camera di guida quando si usa il
+# guider INTERNO (PHD2 non gira). org.kde.kstars.INDI.getBLOBFile ritorna il
+# path del FITS dell'ultimo BLOB ricevuto dal device.
+_INDI_PATH = "/KStars/INDI"
+_INDI_IFACE = "org.kde.kstars.INDI"
+
+
+async def _indi_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[int, str]:
+    return await _qdbus_call(_EKOS_SERVICE, _INDI_PATH,
+                             f"{_INDI_IFACE}.{method}", *args, timeout=timeout)
+
 
 def _read_guider_type() -> "int | None":
     """GuiderType da kstarsrc [Guide]: 0=internal, 1=PHD2, 2=LinGuider.
@@ -455,7 +466,8 @@ async def guide_ekos_status() -> dict:
     """Stato del guider INTERNO di Ekos via DBus: stato + RMS RA/DEC (arcsec)."""
     out: dict = {"state_raw": None, "state": None,
                  "rms_ra": None, "rms_dec": None, "rms_total": None,
-                 "delta_ra": None, "delta_dec": None}
+                 "delta_ra": None, "delta_dec": None,
+                 "camera": None, "guider": None, "exposure": None, "log": []}
     rc, val = await _guide_dbus("status", timeout=6.0)
     if rc == 0 and val.strip():
         v = val.strip()
@@ -472,6 +484,22 @@ async def guide_ekos_status() -> dict:
         nums = _parse_float_list(val)
         if len(nums) >= 2:
             out["delta_ra"], out["delta_dec"] = nums[0], nums[1]
+    # Info aggiuntive per la UI: camera, guider, esposizione, ultime righe di log
+    rc, val = await _guide_dbus("camera", timeout=4.0)
+    out["camera"] = val.strip() if rc == 0 and val.strip() else None
+    rc, val = await _guide_dbus("guider", timeout=4.0)
+    out["guider"] = val.strip() if rc == 0 and val.strip() else None
+    rc, val = await _guide_dbus("exposure", timeout=4.0)
+    try:
+        out["exposure"] = float(val.strip()) if rc == 0 and val.strip() else None
+    except ValueError:
+        out["exposure"] = None
+    rc, val = await _guide_dbus("logText", timeout=4.0)
+    if rc == 0 and val.strip():
+        lines = [ln for ln in val.splitlines() if ln.strip()]
+        out["log"] = lines[-8:]
+    else:
+        out["log"] = []
     return out
 
 
@@ -516,6 +544,73 @@ async def guide_ekos_loop() -> dict:
     """Loop continuo dei frame di guida (loop()), utile per framing/star select."""
     rc, out = await _guide_dbus("loop", timeout=10.0)
     return {"ok": rc == 0, "raw": out}
+
+
+@router.get("/ekos_full_frame")
+async def guide_ekos_full_frame(fmt: str = "json", max_dim: int = 1024) -> dict:
+    """Frame completo della camera di guida quando si usa il GUIDER INTERNO.
+
+    Parita' con /full_frame (PHD2) ma senza PHD2: leggiamo il nome della
+    camera di guida da Ekos.Guide.camera, prendiamo l'ultimo BLOB FITS di
+    quel device via INDI.getBLOBFile, lo stretchiamo (STF stile PI) e
+    ritorniamo PNG. Richiede che la camera stia loopando/guidando (altrimenti
+    nessun frame recente disponibile).
+    """
+    import base64
+    import io
+    import os
+    import numpy as np
+    from fastapi.responses import Response
+    from ..images.processor import _percentile_stretch
+
+    # 1. nome camera di guida
+    rc, cam = await _guide_dbus("camera", timeout=6.0)
+    cam = (cam or "").strip()
+    if rc != 0 or not cam:
+        raise HTTPException(status_code=409,
+            detail="Camera di guida non disponibile. Avvia Ekos e imposta il "
+                   "guider interno con una camera di guida.")
+
+    # 2. path del FITS dell'ultimo BLOB (property/element 'CCD1' per una CCD INDI)
+    rc, out = await _indi_dbus("getBLOBFile", cam, "CCD1", "CCD1", timeout=8.0)
+    fits_path = (out.splitlines()[0].strip() if out else "")
+    if rc != 0 or not fits_path or not os.path.exists(fits_path):
+        raise HTTPException(status_code=409,
+            detail="Nessun frame recente dalla camera di guida. Avvia il loop "
+                   "o la guida (pulsante LOOP/START) e riprova.")
+
+    # 3. FITS -> stretch -> PNG (stesso flusso di /full_frame)
+    try:
+        from astropy.io import fits  # type: ignore
+        with fits.open(fits_path, memmap=False) as hdul:
+            data = np.asarray(hdul[0].data, dtype=np.float64)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"FITS read error: {e}")
+
+    if data.ndim != 2:
+        raise HTTPException(status_code=502,
+            detail=f"FITS shape inattesa: {data.shape} (atteso 2D)")
+
+    h, w = data.shape
+    stretched = _percentile_stretch(data)
+    from PIL import Image
+    img = Image.fromarray(stretched, mode="L")
+    if max_dim > 0 and (w > max_dim or h > max_dim):
+        scale = max_dim / max(w, h)
+        w2, h2 = int(w * scale), int(h * scale)
+        img = img.resize((w2, h2), Image.LANCZOS)
+        w, h = w2, h2
+    img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    png_bytes = buf.getvalue()
+
+    if fmt.lower() == "png":
+        return Response(content=png_bytes, media_type="image/png",
+                        headers={"Cache-Control": "no-store",
+                                 "X-Width": str(w), "X-Height": str(h)})
+    return {"width": w, "height": h, "camera": cam,
+            "png_base64": base64.b64encode(png_bytes).decode("ascii")}
 
 
 # v0.3.3: endpoint full-frame.
