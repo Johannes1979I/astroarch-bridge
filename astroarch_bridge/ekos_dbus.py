@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
+
+from .dbus_session import with_session_bus
 
 log = logging.getLogger(__name__)
 
@@ -26,8 +27,11 @@ _lock = asyncio.Lock()
 
 
 async def _qdbus(*args: str, timeout: float = 5.0) -> tuple[int, str]:
-    env = os.environ.copy()
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    # Stesso bus di tutti gli altri accessi DBus: se KStars gira in una
+    # sessione xrdp questo modulo deve seguirlo, altrimenti guide_camera()
+    # torna None in silenzio (i chiamanti la avvolgono in except: pass) e i
+    # frame della camera di guida tornano a finire nel monitor della home.
+    env = with_session_bus()
     try:
         proc = await asyncio.create_subprocess_exec(
             "qdbus6", *args,

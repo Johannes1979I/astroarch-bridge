@@ -47,11 +47,17 @@ log = logging.getLogger(__name__)
 # browser hides them from JavaScript unless they are listed in
 # Access-Control-Expose-Headers, so a cross-origin web client could not
 # read HFR, dimensions or the map centre coordinates.
-# Emitted by routes/system.py::last_frame and routes/skymap.py::view.
+# Emitted by routes/system.py::last_frame, routes/skymap.py::view and
+# routes/guide.py::phd2_star_image. Keep in step with the source: the list
+# below is the full set of X-* headers the bridge sends, and a header left
+# out of it is simply invisible to a browser client, with no error anywhere.
 CORS_EXPOSE_HEADERS = (
     "X-ts", "X-width", "X-height", "X-hfr", "X-stars", "X-filter",
     "X-exposure", "X-frame_type", "X-object",
     "X-Center-RA-Deg", "X-Center-Dec-Deg", "X-FOV-Deg",
+    # guide star image: without these the web client cannot draw the
+    # crosshair on the guide star, which is the whole point of that frame.
+    "X-Star-X", "X-Star-Y", "X-Frame",
 )
 
 
@@ -169,12 +175,13 @@ def create_app() -> FastAPI:
     app.state.bridge = bridge
 
     if settings.cors_origins:
-        # allow_credentials may be enabled ONLY with an explicit list of
-        # origins: the CORS spec forbids combining it with "*", and the
-        # browser discards the response when Access-Control-Allow-Origin is
-        # "*" and the request is credentialed. The bridge authenticates with
-        # a bearer token in a header, not with cookies, so it does not need
-        # credentials at all.
+        # allow_credentials must not be combined with allow_origins=["*"]:
+        # the CORS spec forbids it, and a browser discards the response of a
+        # credentialed request whose Access-Control-Allow-Origin is "*".
+        # Starlette already avoids emitting that exact pair, so this is not
+        # a live bug being fixed but the configuration saying what it means:
+        # the bridge authenticates with a bearer token in a header, never
+        # with cookies, so it does not need credentials at all.
         allow_all_origins = "*" in settings.cors_origins
         app.add_middleware(
             CORSMiddleware,

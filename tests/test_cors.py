@@ -93,3 +93,27 @@ def test_preflight_allows_authorization_header(client_factory):
     assert r.status_code == 200
     allowed = r.headers.get("access-control-allow-headers", "").lower()
     assert "authorization" in allowed
+
+
+def test_every_x_header_the_bridge_sends_is_exposed():
+    """No X-* header may be left out of Access-Control-Expose-Headers.
+
+    A header missing from that list is not an error anywhere: the browser
+    simply hides it from JavaScript, so the web client silently loses a
+    piece of metadata. Three were missing when this list was first written
+    (the guide star's X-Star-X, X-Star-Y and X-Frame), which is exactly the
+    kind of omission nobody notices by hand.
+    """
+    import re
+    from pathlib import Path
+
+    from astroarch_bridge.app import CORS_EXPOSE_HEADERS
+
+    pkg = Path(__file__).resolve().parent.parent / "astroarch_bridge"
+    declared = {h.lower() for h in CORS_EXPOSE_HEADERS}
+    found: set[str] = set()
+    for src in pkg.rglob("*.py"):
+        for m in re.finditer(r"""['"](X-[A-Za-z0-9_-]+)['"]""", src.read_text(encoding="utf-8")):
+            found.add(m.group(1).lower())
+    missing = sorted(found - declared)
+    assert not missing, f"headers sent but not exposed to browsers: {missing}"

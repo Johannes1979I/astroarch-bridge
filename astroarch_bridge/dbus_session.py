@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 
 _PROC = "/proc"
 _TARGET = "kstars"
+_TARGET_BYTES = _TARGET.encode("ascii")
 _VAR = "DBUS_SESSION_BUS_ADDRESS"
 
 # The address is needed on every DBus call, and scanning /proc for each of
@@ -59,9 +60,9 @@ def _read_environ(pid: str) -> dict[str, str]:
     try:
         with open(f"{_PROC}/{pid}/environ", "rb") as f:
             raw = f.read()
-    except (OSError, PermissionError):
-        # Another user's process is not readable: not an error, just a
-        # candidate to skip.
+    except OSError:
+        # Another user's process is not readable (PermissionError is an
+        # OSError): not an error, just a candidate to skip.
         return {}
     env: dict[str, str] = {}
     for entry in raw.split(b"\x00"):
@@ -81,8 +82,12 @@ def kstars_bus_address() -> str | None:
         return None
     for pid in pids:
         try:
-            with open(f"{_PROC}/{pid}/comm", "r") as f:
-                if f.read().strip() != _TARGET:
+            # In binario: `comm` e' quello che il processo ha scritto in
+            # /proc/self/comm, non per forza UTF-8, e in modalita' testo un
+            # solo processo con un nome strano farebbe saltare la lettura
+            # dell'indirizzo per tutti gli altri.
+            with open(f"{_PROC}/{pid}/comm", "rb") as f:
+                if f.read().strip() != _TARGET_BYTES:
                     continue
         except OSError:
             continue
@@ -103,7 +108,9 @@ def session_bus_address() -> str:
     if addr is None:
         addr = os.environ.get(_VAR) or default_bus_address()
     elif addr != os.environ.get(_VAR):
-        log.debug("using KStars' own session bus: %s", addr)
+        # INFO, non DEBUG: e' esattamente il caso che il manutentore non
+        # puo' vedere in nessun altro modo, e succede una volta ogni TTL.
+        log.info("KStars sta su un altro bus di sessione, uso il suo: %s", addr)
     _cache = (now, addr)
     return addr
 

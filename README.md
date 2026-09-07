@@ -233,6 +233,12 @@ mind that anyone on that network can then post a notification. Set
 | `ASTROARCH_NOTIFY_UDP_HOST` | `127.0.0.1` |
 | `ASTROARCH_NOTIFY_UDP_PORT` | `5005` |
 
+A datagram that is neither valid JSON nor valid UTF-8 is still
+delivered, as text, with the undecodable bytes replaced — a malformed
+alert is worth more than a silent one, and the listener never dies on
+bad input. Note that a plain-text datagram is trusted to be plain text:
+whatever a sender puts in it shows up in the app.
+
 Senders that already speak HTTP can use `POST /api/notify` instead,
 which takes the same fields and requires the bearer token. The last 50
 notifications are kept in memory: they ride along in the WebSocket
@@ -242,28 +248,44 @@ reconnect, and `GET /api/notify/recent` returns them on demand.
 
 The bridge can serve a pre-built web interface from the same origin as
 its own API. Point `ASTROARCH_WEB_DIR` at a folder containing an
-`index.html` and it is mounted at `/`; if the folder is absent nothing
-is mounted and the bridge behaves exactly as before.
+`index.html` and it is mounted at `/ui`; if the folder is absent
+nothing is mounted and the bridge behaves exactly as before. The path
+must be absolute — an empty or relative `ASTROARCH_WEB_DIR` is refused
+rather than publishing the daemon's working directory.
 
 ```bash
 ASTROARCH_WEB_DIR=/usr/share/astroarch-bridge/web astroarch-bridge
 # then, from any device on the same network:
-#   http://astroarch.local:8765/
+#   http://astroarch.local:8765/ui/      (or just :8765/, which redirects)
 ```
 
 Same-origin is the point, not a convenience. A page served over HTTPS
 from anywhere else cannot call `http://astroarch.local:8765` at all —
 browsers block mixed content with no workaround available to the page.
-Serving the UI from the bridge sidesteps both that and CORS, and needs
-no certificate, which matters in the field where there is no internet
-to obtain or renew one.
+Serving the UI from the bridge sidesteps that and CORS together, and
+needs no certificate, which matters in the field where there is no
+internet to obtain or renew one.
 
-The mount is registered last, so `/api`, `/ws` and `/healthz` keep
-precedence over it. Unknown paths fall back to `index.html` so that
-client-side routes survive a reload, except under those reserved
-prefixes and for paths that look like files — a missing `main.dart.js`
-stays an honest 404 rather than becoming HTML that the browser would
-report as a baffling syntax error.
+**Why `/ui` and not `/`.** A catch-all mount on the root matches every
+path before the framework can do anything else, and three things break
+as a result — all measured on a running daemon, not guessed:
+`/api/system/info/` and `/healthz/` stop redirecting and start 404ing;
+a wrong verb on a real endpoint turns from an honest 405 into a 404, so
+a live route looks like it does not exist; and a WebSocket to any
+unrouted path reaches the static handler, which answers with a 500 and
+a traceback in the journal instead of a clean rejection. Under `/ui`
+none of that applies, and same-origin still holds.
+
+Inside the mount, unknown paths fall back to `index.html` so that
+client-side routes survive a reload — except for paths that look like
+files, so a missing `main.dart.js` stays an honest 404 rather than
+becoming HTML the browser would report as a baffling syntax error.
+
+⚠️ **The mount carries no authentication.** Every API router requires
+the bearer token; this one cannot, because a browser has no way to send
+a token when it fetches its own first page. Whatever `ASTROARCH_WEB_DIR`
+points at is readable by anyone who can reach port 8765. Point it at a
+UI build and at nothing else.
 
 ---
 
