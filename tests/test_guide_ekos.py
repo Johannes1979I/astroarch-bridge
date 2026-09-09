@@ -105,3 +105,74 @@ def test_guide_state_table_matches_ekos_h():
     assert t[16] == "MANUAL_DITHERING"
     assert t[19] == "DITHERING_SETTLE"
     assert len(t) == 20
+
+
+# --- quale guider usa Ekos: la fonte di verita' e' il PROFILO ----------------
+#
+# Il bug: si leggeva solo `kstarsrc [Guide] GuiderType`. Sull'osservatorio vero
+# quella chiave NON esiste (verificato), e la scelta fra guider interno e PHD2
+# si fa nel profilo Ekos, nella tabella `profile` di userdb.sqlite. Risultato:
+# l'app diceva "guida interna" anche dopo aver selezionato PHD2 nel setup.
+
+def _make_profile_db(home, profiles):
+    """userdb.sqlite con la tabella profile, come la crea KStars."""
+    import sqlite3
+    d = home / ".local/share/kstars"
+    d.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(d / "userdb.sqlite")
+    con.execute("CREATE TABLE profile (id INTEGER PRIMARY KEY, name TEXT, "
+                "guidertype INTEGER, guiderhost TEXT, guiderport INTEGER)")
+    for i, (name, gt) in enumerate(profiles, start=1):
+        con.execute("INSERT INTO profile (id, name, guidertype, guiderhost, guiderport)"
+                    " VALUES (?,?,?,?,?)", (i, name, gt, "localhost", 4400))
+    con.commit()
+    con.close()
+
+
+def test_guider_comes_from_the_active_profile(tmp_path, monkeypatch):
+    # Ricostruisce esattamente l'osservatorio: kstarsrc senza GuiderType,
+    # profilo attivo indicato, e il profilo che dice PHD2.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Ekos]\nprofile=Askar\n\n[Guide]\nDitherEnabled=true\n")
+    _make_profile_db(tmp_path, [("Simulators", 0), ("Askar", 1)])
+    assert guide._active_profile_name() == "Askar"
+    assert guide._read_guider_type() == 1
+
+
+def test_switching_the_profile_switches_the_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Ekos]\nprofile=Simulators\n")
+    _make_profile_db(tmp_path, [("Simulators", 0), ("Askar", 1)])
+    assert guide._read_guider_type() == 0
+
+
+def test_the_profile_wins_over_kstarsrc(tmp_path, monkeypatch):
+    """Se i due dicono cose diverse comanda il profilo: e' quello che Ekos usa."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Ekos]\nprofile=Askar\n\n[Guide]\nGuiderType=0\n")
+    _make_profile_db(tmp_path, [("Askar", 1)])
+    assert guide._read_guider_type() == 1
+
+
+def test_without_a_database_it_falls_back_to_kstarsrc(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Guide]\nGuiderType=2\n")
+    assert guide._read_guider_type() == 2
+
+
+def test_a_single_profile_answers_even_without_an_active_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Guide]\nDitherEnabled=true\n")
+    _make_profile_db(tmp_path, [("Askar", 1)])
+    assert guide._read_guider_type() == 1
+
+
+def test_the_database_is_never_written(tmp_path, monkeypatch):
+    """KStars puo' averlo aperto nello stesso momento: si legge e basta."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_kstarsrc(tmp_path, "[Ekos]\nprofile=Askar\n")
+    _make_profile_db(tmp_path, [("Askar", 1)])
+    db = tmp_path / ".local/share/kstars/userdb.sqlite"
+    before = db.read_bytes()
+    guide._read_guider_type()
+    assert db.read_bytes() == before

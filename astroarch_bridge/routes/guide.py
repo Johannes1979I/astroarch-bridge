@@ -439,34 +439,95 @@ async def _indi_dbus(method: str, *args: str, timeout: float = 10.0) -> tuple[in
 _GUIDER_TYPE_DEFAULT = 0
 
 
-def _read_guider_type() -> "int | None":
-    """GuiderType from kstarsrc [Guide]: 0=internal, 1=PHD2, 2=LinGuider.
-
-    When the key is missing this returns the KStars default rather than
-    None, because that is what Ekos is actually using. None stays reserved
-    for the cases where nothing can be said — no kstarsrc, or a file that
-    cannot be read.
-
-    Read-only, nothing is modified.
-    """
+def _kstarsrc_value(section: str, key: str) -> "str | None":
+    """Legge una chiave da ~/.config/kstarsrc. Sola lettura."""
     from pathlib import Path
     cfg = Path.home() / ".config/kstarsrc"
     if not cfg.exists():
         return None
     try:
-        in_guide = False
+        cur = None
         for line in cfg.read_text(encoding="utf-8").splitlines():
             t = line.strip()
             if t.startswith("[") and t.endswith("]"):
-                in_guide = (t == "[Guide]")
+                cur = t[1:-1]
                 continue
-            if in_guide and t.startswith("GuiderType="):
-                try:
-                    return int(t.split("=", 1)[1])
-                except ValueError:
-                    return _GUIDER_TYPE_DEFAULT
+            if cur == section and t.startswith(key + "="):
+                return t.split("=", 1)[1].strip()
     except Exception as e:
-        _logger.warning("cannot read GuiderType: %s", e)
+        _logger.warning("kstarsrc illeggibile: %s", e)
+    return None
+
+
+def _active_profile_name() -> "str | None":
+    """Il profilo Ekos attivo, da kstarsrc [Ekos] profile=."""
+    return _kstarsrc_value("Ekos", "profile")
+
+
+def _guider_type_from_profile() -> "int | None":
+    """Il guider scelto nel PROFILO Ekos, cioe' quello impostato nel setup.
+
+    E' questa la fonte di verita', non `kstarsrc [Guide] GuiderType`. Quella
+    chiave riguarda le preferenze del modulo Guida e su un'installazione vera
+    puo' non esistere affatto (verificato: sull'osservatorio non c'e'); la
+    scelta fra guider interno, PHD2 e LinGuider e' invece un campo del
+    profilo e vive nella tabella `profile` di userdb.sqlite, insieme a host e
+    porta del guider esterno (4400 = PHD2).
+
+    Il database si apre in SOLA LETTURA (`mode=ro`): KStars puo' averlo
+    aperto nello stesso momento e non va toccato in nessun caso.
+    """
+    import sqlite3
+    from pathlib import Path
+    db = Path.home() / ".local/share/kstars/userdb.sqlite"
+    if not db.exists():
+        return None
+    name = _active_profile_name()
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            cur = con.cursor()
+            if name:
+                row = cur.execute(
+                    "SELECT guidertype FROM profile WHERE name = ?", (name,)
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    return int(row[0])
+            # Senza profilo attivo, un solo profilo non e' ambiguo: meglio
+            # rispondere che tacere.
+            rows = cur.execute(
+                "SELECT guidertype FROM profile WHERE guidertype IS NOT NULL"
+            ).fetchall()
+            if len(rows) == 1:
+                return int(rows[0][0])
+        finally:
+            con.close()
+    except Exception as e:
+        _logger.warning("userdb.sqlite non leggibile: %s", e)
+    return None
+
+
+def _read_guider_type() -> "int | None":
+    """Quale guider usa Ekos: 0=interno, 1=PHD2, 2=LinGuider.
+
+    Prima il profilo (il setup), poi kstarsrc, infine il default dichiarato
+    da KStars. Leggere solo kstarsrc era il bug: dove quella chiave non e'
+    mai stata scritta la risposta era sempre "interno", anche dopo aver
+    scelto PHD2 nel setup.
+
+    Sola lettura: non viene modificato nulla.
+    """
+    gt = _guider_type_from_profile()
+    if gt is not None:
+        return gt
+    raw = _kstarsrc_value("Guide", "GuiderType")
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            return _GUIDER_TYPE_DEFAULT
+    from pathlib import Path
+    if not (Path.home() / ".config/kstarsrc").exists():
         return None
     return _GUIDER_TYPE_DEFAULT
 
@@ -498,7 +559,14 @@ async def guide_backend() -> dict:
     L'app lo legge per adattare la UI (pannello PHD2 vs guider interno)."""
     gt = _read_guider_type()
     name = {0: "internal", 1: "phd2", 2: "linguider"}.get(gt)
-    return {"backend": name, "guider_type": gt}
+    # `source` dice da dove viene la risposta: senza, distinguere "il profilo
+    # dice interno" da "non ho trovato nulla e ho usato il default" richiede
+    # di collegarsi al Raspberry.
+    src = ("profile" if _guider_type_from_profile() is not None
+           else "kstarsrc" if _kstarsrc_value("Guide", "GuiderType") is not None
+           else "default")
+    return {"backend": name, "guider_type": gt, "source": src,
+            "profile": _active_profile_name()}
 
 
 @router.get("/ekos_status")
