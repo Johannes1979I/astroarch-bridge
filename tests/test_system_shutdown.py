@@ -146,8 +146,8 @@ async def test_endpoint_refuses_with_409_and_lists_reasons(mount_present, no_cap
 
     bridge = _FakeBridge(props={"TELESCOPE_PARK": _park_property(False)})
     with pytest.raises(HTTPException) as excinfo:
-        await system.shutdown(background=BackgroundTasks(), payload={},
-                              bridge=bridge)
+        await system.shutdown(background=BackgroundTasks(),
+                              payload={"confirm": True}, bridge=bridge)
     assert excinfo.value.status_code == 409
     assert excinfo.value.detail["blockers"][0]["code"] == "mount_unparked"
 
@@ -161,7 +161,7 @@ async def test_force_overrides_and_still_reports_what_was_overridden(
     bridge = _FakeBridge(props={"TELESCOPE_PARK": _park_property(False)})
     background = BackgroundTasks()
     out = await system.shutdown(background=background,
-                                payload={"force": True}, bridge=bridge)
+                                payload={"force": True, "confirm": True}, bridge=bridge)
     assert out["ok"] is True
     assert out["forced"] is True
     assert [b["code"] for b in out["blockers"]] == ["mount_unparked"]
@@ -175,7 +175,7 @@ async def test_bad_mode_is_rejected(mount_present, no_capture):
     bridge = _FakeBridge(props={"TELESCOPE_PARK": _park_property(True)})
     with pytest.raises(HTTPException) as excinfo:
         await system.shutdown(background=BackgroundTasks(),
-                              payload={"mode": "halt"}, bridge=bridge)
+                              payload={"mode": "halt", "confirm": True}, bridge=bridge)
     assert excinfo.value.status_code == 400
 
 
@@ -185,12 +185,12 @@ async def test_reboot_endpoint_reuses_the_same_guard(mount_present, no_capture):
 
     bridge = _FakeBridge(props={"TELESCOPE_PARK": _park_property(False)})
     with pytest.raises(HTTPException) as excinfo:
-        await system.reboot(background=BackgroundTasks(), payload={},
-                            bridge=bridge)
+        await system.reboot(background=BackgroundTasks(),
+                            payload={"confirm": True}, bridge=bridge)
     assert excinfo.value.status_code == 409
 
     out = await system.reboot(background=BackgroundTasks(),
-                              payload={"force": True}, bridge=bridge)
+                              payload={"force": True, "confirm": True}, bridge=bridge)
     assert out["mode"] == "reboot"
 
 
@@ -230,14 +230,16 @@ def test_route_is_registered_and_needs_the_token(client):
 
 
 def test_shutdown_returns_immediately_and_schedules_the_poweroff(client):
-    r = client.post("/api/system/shutdown", json={}, headers=AUTH)
+    r = client.post("/api/system/shutdown", json={"confirm": True},
+                       headers=AUTH)
     assert r.status_code == 200
     assert r.json()["mode"] == "poweroff"
     assert client.fired == ["poweroff"]
 
 
 def test_reboot_route_asks_for_a_reboot(client):
-    r = client.post("/api/system/reboot", json={}, headers=AUTH)
+    r = client.post("/api/system/reboot", json={"confirm": True},
+                       headers=AUTH)
     assert r.status_code == 200
     assert r.json()["mode"] == "reboot"
     assert client.fired == ["reboot"]
@@ -247,4 +249,39 @@ def test_shutdown_check_is_a_plain_read(client):
     r = client.get("/api/system/shutdown_check", headers=AUTH)
     assert r.status_code == 200
     assert r.json() == {"safe": True, "blockers": []}
+    assert client.fired == []
+
+
+# ---------------------------------------------------------------------------
+# Il consenso esplicito. Nato da un incidente vero: una POST mandata per
+# provare "esiste la rotta?" ha riavviato due osservatori. Il token da solo
+# non basta a distinguere l'intenzione dalla distrazione.
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_without_confirm_is_refused(client):
+    r = client.post("/api/system/shutdown", json={}, headers=AUTH)
+    assert r.status_code == 400
+    assert "confirm" in r.text
+    assert client.fired == []
+
+
+def test_reboot_without_confirm_is_refused(client):
+    r = client.post("/api/system/reboot", json={}, headers=AUTH)
+    assert r.status_code == 400
+    assert client.fired == []
+
+
+def test_force_alone_is_not_consent(client):
+    """force salta i motivi di rifiuto; non dichiara l'intenzione."""
+    r = client.post("/api/system/shutdown", json={"force": True}, headers=AUTH)
+    assert r.status_code == 400
+    assert client.fired == []
+
+
+def test_reboot_refuses_a_contradictory_mode(client):
+    """Ignorare in silenzio un mode sbagliato e' come dire di si a caso."""
+    r = client.post("/api/system/reboot",
+                    json={"confirm": True, "mode": "poweroff"}, headers=AUTH)
+    assert r.status_code == 400
     assert client.fired == []

@@ -887,6 +887,14 @@ async def shutdown(
         raise HTTPException(status_code=400,
                             detail="mode deve essere 'poweroff' o 'reboot'")
 
+    # Consenso esplicito. Non protegge da un attaccante — chi ha il token
+    # puo' scriverlo — ma protegge dall'incidente: una POST partita per
+    # sbaglio, un client rimasto indietro, un `curl` di prova. Chi spegne
+    # un osservatorio deve averlo scritto a lettere.
+    if not bool(payload.get("confirm", False)):
+        raise HTTPException(status_code=400, detail=(
+            "serve \"confirm\": true nel body: questa rotta spegne la macchina"))
+
     blockers = await _shutdown_blockers(bridge)
     if blockers and not force:
         raise HTTPException(status_code=409, detail={
@@ -914,7 +922,15 @@ async def reboot(
     payload: dict = Body(default={}),
     bridge: Bridge = Depends(get_bridge),
 ) -> dict:
-    """Riavvio ordinato. Stesse protezioni di /shutdown."""
+    """Riavvio ordinato. Stesse protezioni di /shutdown.
+
+    Un `mode` diverso da "reboot" e' un errore, non un dettaglio da
+    correggere in silenzio: chi lo ha scritto crede di star chiedendo
+    altro, e su questa rotta "altro" vorrebbe dire spegnere."""
+    mode = str(payload.get("mode", "reboot"))
+    if mode != "reboot":
+        raise HTTPException(status_code=400, detail=(
+            f"/reboot non accetta mode={mode!r}: usa /shutdown"))
     return await shutdown(background=background,
                           payload={**payload, "mode": "reboot"},
                           bridge=bridge)
