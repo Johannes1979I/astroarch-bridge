@@ -1,7 +1,7 @@
 """Route /api/system: stato globale, snapshot, info."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 
 from .. import __version__
 from ..auth import require_token
@@ -37,7 +37,6 @@ async def last_frame(bridge: Bridge = Depends(get_bridge)):
     re-invia (es. al rientro da background: il frame era già stato
     broadcastato mentre l'app era sospesa). 404 se nessun frame ancora.
     I metadati vanno negli header X-*."""
-    from fastapi import HTTPException
     from fastapi.responses import Response
     jpeg, meta = await bridge.state.last_jpeg()
     if not jpeg:
@@ -705,3 +704,217 @@ async def qr_pairing(fmt: str = "json"):
         "payload": payload,
         "png_base64": base64.b64encode(png_bytes).decode("ascii"),
     }
+
+
+# ============================================================================
+# SPEGNIMENTO ORDINATO DELL'OSSERVATORIO
+# ============================================================================
+#
+# Perche' esiste: togliere corrente a Linux mentre gira butta via le scritture
+# ancora in memoria. I file scritti piu' spesso sono proprio le configurazioni
+# (userdb.sqlite di Ekos, kstarsrc, ParkData.xml), e su microSD puo' sparire
+# l'intera scheda, perche' il controller perde la propria tabella di mappatura
+# interna: un guasto sotto il filesystem, dove il giornale ext4 non arriva.
+#
+# Come spegne: `systemctl poweroff` SENZA sudo, cioe' chiedendolo a logind.
+# Non e' un dettaglio stilistico. La via `sudo` sembra ovvia e non regge:
+#   - il servizio puo' girare con NoNewPrivileges=yes, che rende inerti i
+#     binari setuid, sudo compreso — e fallisce in silenzio;
+#   - la politica di sudo non e' la stessa su tutte le installazioni.
+# logind invece risponde CanPowerOff="yes" anche dal contesto del servizio
+# utente (verificato con `systemd-run --user ... systemctl --dry-run poweroff`),
+# quindi e' l'unica strada che funziona ovunque senza toccare sudoers.
+# Il tentativo con `sudo -n` resta come sola rete di sicurezza.
+
+_POWEROFF_GRACE_SECONDS = 3.0   # respiro perche' la risposta HTTP arrivi all'app
+_EKOS_STOP_SETTLE_SECONDS = 2.0
+_PHD2_BUSY_STATES = {"Guiding", "Calibrating", "LostLock", "Looping"}
+
+
+async def _shutdown_blockers(bridge: Bridge) -> list[dict]:
+    """Motivi per cui spegnere ORA sarebbe una cattiva idea.
+
+    Lista vuota = via libera. Non solleva mai: se un dato non e' leggibile
+    non blocca, perche' "Ekos e' spento" e "non riesco a leggerlo" portano
+    alla stessa conclusione pratica — non c'e' una sessione da proteggere.
+    """
+    blockers: list[dict] = []
+
+    # 1. Montatura non in park. E' il piu' importante dei tre: chiudere con
+    #    la montatura ferma dove capita significa ripartire senza sapere
+    #    dove punta, e il primo movimento puo' finire contro la colonna.
+    try:
+        from ._roles import first_element, resolve_device
+        dev = await resolve_device(bridge.state, "mount", None)
+        if dev:
+            park = await bridge.state.get_property(dev, "TELESCOPE_PARK") or {}
+            if park and not first_element(park, "PARK", False):
+                blockers.append({
+                    "code": "mount_unparked",
+                    "device": dev,
+                    "message": "La montatura non e' in park.",
+                })
+    except Exception:
+        pass
+
+    # 2. Sequenza di ripresa in corso: active_job_id >= 0.
+    try:
+        from .capture_ekos import (_dbus_call, EKOS_CAPTURE_PATH,
+                                   EKOS_DBUS_SERVICE)
+        rc, val = await _dbus_call(EKOS_DBUS_SERVICE, EKOS_CAPTURE_PATH,
+                                   "org.kde.kstars.Ekos.Capture.getActiveJobID")
+        if rc == 0 and val.lstrip("-").isdigit() and int(val) >= 0:
+            blockers.append({
+                "code": "capture_running",
+                "job_id": int(val),
+                "message": "C'e' una sequenza di ripresa in corso.",
+            })
+    except Exception:
+        pass
+
+    # 3. Guida attiva (PHD2). Lo stato vive nella cache live del bridge.
+    try:
+        app_state = (bridge.phd2.live or {}).get("app_state")
+        if app_state in _PHD2_BUSY_STATES:
+            blockers.append({
+                "code": "guiding",
+                "app_state": app_state,
+                "message": f"La guida e' attiva (PHD2: {app_state}).",
+            })
+    except Exception:
+        pass
+
+    return blockers
+
+
+@router.get("/shutdown_check")
+async def shutdown_check(bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Cosa succederebbe spegnendo adesso.
+
+    L'app la chiama PRIMA di mostrare la conferma, cosi' l'utente legge i
+    motivi nella finestra di conferma invece di ricevere un rifiuto dopo
+    aver premuto."""
+    blockers = await _shutdown_blockers(bridge)
+    return {"safe": not blockers, "blockers": blockers}
+
+
+async def _graceful_close_and_power(mode: str) -> None:
+    """Chiude l'osservatorio nell'ordine giusto, poi spegne.
+
+    Gira come BackgroundTask: quando parte, la risposta HTTP e' gia' stata
+    consegnata all'app. Se aspettassimo il poweroff per rispondere, l'app
+    vedrebbe solo una connessione caduta e non saprebbe se ha funzionato."""
+    import asyncio
+    import logging as _log
+    _logger = _log.getLogger("astroarch_bridge.system")
+
+    # 1. Ekos giu' per primo: disconnette i driver e chiude l'INDI server in
+    #    modo ordinato. Se KStars non c'e', la chiamata DBus fallisce e
+    #    proseguiamo: non e' un errore, e' un osservatorio gia' fermo.
+    try:
+        from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
+        # Stesso ordine di ekos_toggle: prima si staccano i driver, poi si
+        # ferma Ekos. I setter DBus di Ekos sono Q_NOREPLY, quindi rc=0 non
+        # significa "fatto": non ci si fida del codice di ritorno, si
+        # verifica dopo con _pgrep_any.
+        await _dbus_call(EKOS_DBUS_SERVICE, "/KStars/Ekos",
+                         "org.kde.kstars.Ekos.disconnectDevices")
+        await asyncio.sleep(0.20)
+        await _dbus_call(EKOS_DBUS_SERVICE, "/KStars/Ekos",
+                         "org.kde.kstars.Ekos.stop")
+        await asyncio.sleep(_EKOS_STOP_SETTLE_SECONDS)
+    except Exception:
+        _logger.warning("shutdown: chiusura Ekos non riuscita, proseguo")
+
+    # 2. PHD2 e KStars: SIGTERM, poi SIGKILL ai sopravvissuti.
+    #    _pkill usa `pkill -x` sul nome esatto. Il `-f` qui sarebbe un
+    #    disastro: ucciderebbe anche la sessione SSH che ha quella stringa
+    #    nella propria riga di comando (successo davvero, 09/09).
+    for names in (("phd2", "phd2.bin"), ("kstars", "kstars.bin")):
+        try:
+            n = await _pkill(*names)
+            if n:
+                _logger.info("shutdown: terminati %d processi %s", n, names[0])
+        except Exception:
+            _logger.warning("shutdown: pkill %s non riuscito", names[0])
+
+    # 3. Spegnimento vero.
+    await asyncio.sleep(_POWEROFF_GRACE_SECONDS)
+    verb = "reboot" if mode == "reboot" else "poweroff"
+    for cmd in (["systemctl", verb], ["sudo", "-n", "systemctl", verb]):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await proc.wait() == 0:
+                _logger.info("shutdown: %s accettato (%s)", verb, " ".join(cmd))
+                return
+        except Exception:
+            continue
+    _logger.error("shutdown: nessun metodo di %s ha funzionato", verb)
+
+
+@router.post("/shutdown")
+async def shutdown(
+    background: BackgroundTasks,
+    payload: dict = Body(default={}),
+    bridge: Bridge = Depends(get_bridge),
+) -> dict:
+    """Chiude l'osservatorio e spegne (o riavvia) il Raspberry.
+
+    Body:
+      force: bool = False   ignora i motivi di rifiuto elencati sotto
+      mode:  str  = "poweroff"   oppure "reboot"
+
+    Rifiuta con 409 se c'e' una sessione in corso — montatura fuori park,
+    sequenza attiva o guida in funzione — a meno di force=true. E' lo
+    stesso principio di kill_kstars: non si chiude per sbaglio una nottata.
+
+    Non parcheggia la montatura e non tocca la configurazione di Ekos: il
+    bridge resta un client secondario non invasivo (CLAUDE.md). Se la
+    montatura non e' in park lo dice e si ferma, non decide al posto tuo.
+
+    Risponde SUBITO; la chiusura e lo spegnimento avvengono dopo, cosi'
+    l'app puo' mostrare all'utente quando e' sicuro togliere corrente."""
+    import logging as _log
+    _logger = _log.getLogger("astroarch_bridge.system")
+
+    force = bool(payload.get("force", False))
+    mode = str(payload.get("mode", "poweroff"))
+    if mode not in ("poweroff", "reboot"):
+        raise HTTPException(status_code=400,
+                            detail="mode deve essere 'poweroff' o 'reboot'")
+
+    blockers = await _shutdown_blockers(bridge)
+    if blockers and not force:
+        raise HTTPException(status_code=409, detail={
+            "message": "Osservatorio in attivita': spegnimento rifiutato.",
+            "blockers": blockers,
+        })
+
+    eta = _EKOS_STOP_SETTLE_SECONDS + 4.0 + _POWEROFF_GRACE_SECONDS
+    _logger.info("shutdown richiesto: mode=%s force=%s blockers=%d",
+                 mode, force, len(blockers))
+    background.add_task(_graceful_close_and_power, mode)
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "forced": bool(blockers),
+        "blockers": blockers,
+        "eta_seconds": round(eta, 1),
+    }
+
+
+@router.post("/reboot")
+async def reboot(
+    background: BackgroundTasks,
+    payload: dict = Body(default={}),
+    bridge: Bridge = Depends(get_bridge),
+) -> dict:
+    """Riavvio ordinato. Stesse protezioni di /shutdown."""
+    return await shutdown(background=background,
+                          payload={**payload, "mode": "reboot"},
+                          bridge=bridge)

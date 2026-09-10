@@ -1,6 +1,6 @@
 # Maintainer: Zarletti-Osservatorio Jupiter
 pkgname=astroarch-bridge
-pkgver=0.3.16
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="Backend daemon per Astroarch Interface Android app - clone live INDI/Ekos/PHD2"
 arch=('any')
