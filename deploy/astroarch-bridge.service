@@ -15,10 +15,9 @@ StandardError=journal
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=full
-ProtectHome=read-only
-# systemd creates ConfigurationDirectory before namespace setup, unlike ExecStartPre
-ConfigurationDirectory=astroarch-bridge
-ReadWritePaths=%h/.config/astroarch-bridge %h/Pictures/Ekos
+
+# Must be set to ‘false’ to allow write access to the Home directory for individual users
+ProtectHome=false
 
 # IMPORTANT: NOTHING PrivateTmp=true. The bridge must be able to read
 # the xauth file of the user logged in graphically (e.g., /tmp/xauth_XXXXXX

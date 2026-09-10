@@ -1,4 +1,4 @@
-# Maintainer: Zarletti-Osservatorio Jupiter
+# Maintainer: Mattia matto.astro@gmail.com
 pkgname=astroarch-bridge
 pkgver=0.3.16
 pkgrel=1
@@ -6,13 +6,17 @@ pkgdesc="Backend daemon per Astroarch Interface Android app - clone live INDI/Ek
 arch=('any')
 url="https://github.com/Johannes1979I/astroarch-bridge"
 license=('MIT')
+# Post-installation script
+install=astroarch-bridge.install
 depends=(
+    tk
     python-astropy
     python-fastapi
     python-numpy
     python-pillow
     python-pydantic
     python-pydantic-settings
+    python-qrcode
     python-watchdog
     python-websockets
     uvicorn
@@ -32,11 +36,10 @@ build() {
 }
 
 package() {
-  cd "${srcdir}/${pkgname}-${pkgver}"
+  cd ${srcdir}/${pkgname}-${pkgver}
   python -m installer --destdir="$pkgdir" dist/*.whl
-  install -Dm644 "deploy/astroarch-bridge.service" \
-    "$pkgdir/usr/lib/systemd/user/astroarch-bridge.service"
-  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-  mkdir -p "$pkgdir/usr/share/${pkgname}/desktop_dashboard"
-  cp -r "$srcdir/desktop_dashboard/." "$pkgdir/usr/share/${pkgname}/desktop_dashboard/"
+  install -Dm644 deploy/astroarch-bridge.service ${pkgdir}/usr/lib/systemd/user/astroarch-bridge.service
+  install -Dm644 LICENSE ${pkgdir}/usr/share/licenses/${pkgname}/LICENSE
+  mkdir -p ${pkgdir}/usr/share/${pkgname}/desktop_dashboard
+  cp -r desktop_dashboard/* ${pkgdir}/usr/share/${pkgname}/desktop_dashboard/
 }
