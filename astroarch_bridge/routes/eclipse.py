@@ -59,6 +59,7 @@ class _Conductor:
         self.base_dir: Optional[str] = None  # <images_dir>/Eclissi (cartella madre)
         self.cool: bool = False
         self.cool_temp: float = -10.0
+        self.last_temp: Optional[float] = None  # temperatura camera letta
         self.frames_shot: int = 0
         self.frames_total: int = 0
         self.started_at: float = 0.0
@@ -91,6 +92,9 @@ class _Conductor:
             "auto_enabled": self.auto_enabled,
             "last_median": self.last_median,
             "last_vmax": self.last_vmax,
+            "cooling": self.cool,
+            "cool_temp": self.cool_temp,
+            "last_temp": self.last_temp,
             "error": self.error,
             "logs": self.logs[-30:],
         }
@@ -528,6 +532,36 @@ def _auto_adjust() -> None:
             f"(median={median}, vmax={vmax})")
 
 
+async def _wait_for_temperature(bridge: Bridge, dev: str, target: float,
+                                tol: float = 1.0, timeout: float = 300.0) -> bool:
+    """Attende che la camera raggiunga la temperatura target (±tol) PRIMA di
+    scattare. Senza questo, gli scatti raffreddati non hanno senso (dark/segnale
+    incoerenti). Ritorna True se raggiunta, False su timeout/abort. Best-effort:
+    se il driver non espone CCD_TEMPERATURE, prosegue senza bloccare."""
+    t0 = time.monotonic()
+    CONDUCTOR.note(f"❄️ Attendo raffreddamento a {target:.0f}°C (±{tol:.0f})…")
+    seen = False
+    while time.monotonic() - t0 < timeout:
+        if CONDUCTOR.pending.get("abort"):
+            return False
+        p = await bridge.state.get_property(dev, "CCD_TEMPERATURE")
+        cur = first_element(p or {}, "CCD_TEMPERATURE_VALUE", None)
+        if cur is not None:
+            seen = True
+            CONDUCTOR.last_temp = float(cur)
+            if abs(float(cur) - target) <= tol:
+                CONDUCTOR.note(f"❄️ Temperatura raggiunta: {float(cur):.1f}°C")
+                return True
+        elif not seen and time.monotonic() - t0 > 12.0:
+            # Il driver non pubblica la temperatura: non blocchiamo all'infinito.
+            CONDUCTOR.note("Raffreddamento: driver senza CCD_TEMPERATURE, proseguo")
+            return False
+        await asyncio.sleep(3.0)
+    CONDUCTOR.note(
+        f"⚠️ Timeout raffreddamento ({CONDUCTOR.last_temp}°C, target {target:.0f}°C): proseguo")
+    return False
+
+
 async def _run(bridge: Bridge) -> None:
     dev = CONDUCTOR.device
     plan = CONDUCTOR.plan
@@ -536,6 +570,13 @@ async def _run(bridge: Bridge) -> None:
         return
     overhead = float(plan.get("overhead_sec", 1.5))
     try:
+        # Raffreddamento: la T deve raggiungere il target PRIMA di scattare.
+        if CONDUCTOR.cool:
+            CONDUCTOR.phase = "cooling"
+            await _wait_for_temperature(bridge, dev, CONDUCTOR.cool_temp)
+            if CONDUCTOR.pending.get("abort"):
+                raise _Abort()
+            CONDUCTOR.phase = "running"
         for i, blk in enumerate(plan["blocks"]):
             if CONDUCTOR.pending.get("abort"):
                 raise _Abort()
