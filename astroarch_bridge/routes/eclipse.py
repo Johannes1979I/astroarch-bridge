@@ -52,6 +52,9 @@ _TARGET_MEDIAN_FRAC = 0.28   # (legacy) mediana "buona" — non usata per il dis
 # fondo scuro) → sempre "dark". Il p99.9 misura invece il disco.
 _DARK_P999_FRAC = 0.35       # p99.9 sotto → disco troppo debole → aumenta
 _TARGET_P999_FRAC = 0.60     # p99.9 a cui puntare (disco ben esposto, no clip)
+# Sessione temporizzata (timer primo contatto)
+_FIRST_CONTACT_PCT = 1.5     # % di copertura oltre cui il 1° contatto è confermato
+_CONTACT_POLL_SEC = 12.0     # cadenza degli scatti di conferma vicino al contatto
 
 
 class _Abort(Exception):
@@ -83,6 +86,12 @@ class _Conductor:
         self.last_vmax: Optional[float] = None
         self.last_p999: Optional[float] = None  # luminosità disco (calibrazione)
         self.last_good_eff: Optional[float] = None  # ultima posa "ok" (seme fase dopo)
+        # --- Sessione temporizzata (timer primo contatto) ---
+        self.session: bool = False            # modalità sessione schedulata attiva
+        self.session_phase: str = "idle"      # idle|waiting_contact|running|done
+        self.sim: bool = False                # simulazione (pilota da orologio)
+        self.coverage: Optional[float] = None # % ingresso ombra misurata dallo scatto
+        self.t0: Optional[float] = None        # epoch del 1° contatto confermato
         self.pending: dict[str, Any] = {}
         self.logs: list[str] = []
         self.error: Optional[str] = None
@@ -113,6 +122,12 @@ class _Conductor:
             "cool_temp": self.cool_temp,
             "last_temp": self.last_temp,
             "calib_shot": self.calib_shot,
+            "session": self.session,
+            "session_phase": self.session_phase,
+            "sim": self.sim,
+            "coverage": self.coverage,
+            "t0": self.t0,
+            "mission_elapsed": round(time.time() - self.t0, 1) if self.t0 else None,
             "error": self.error,
             "logs": self.logs[-30:],
         }
@@ -360,6 +375,8 @@ async def start(bridge: Bridge = Depends(get_bridge)) -> dict:
     CONDUCTOR.calib_shot = 0
     CONDUCTOR.block_idx = -1
     CONDUCTOR.ev_bias_stops = 0.0
+    CONDUCTOR.session = False
+    CONDUCTOR.session_phase = "idle"
     CONDUCTOR.started_at = time.monotonic()
     CONDUCTOR.phase = "running"
     CONDUCTOR.task = asyncio.ensure_future(_run(bridge))
@@ -678,6 +695,21 @@ async def _shoot_one(bridge: Bridge, dev: str, eff: float, overhead: float):
     return m, v, p
 
 
+async def _measure_coverage(bridge: Bridge, dev: str, eff: float,
+                            ref_frac: Optional[float], overhead: float):
+    """Scatta a esposizione fissa `eff` e misura la % di ingresso dell'ombra:
+    coverage = 1 − (frazione illuminata ora / frazione a disco pieno `ref_frac`).
+    La stessa `eff` di riferimento va usata per confronti coerenti."""
+    await _shoot_one(bridge, dev, eff, overhead)
+    snap = await bridge.state.snapshot()
+    frac = (snap.get("last_frame") or {}).get("bright_frac")
+    if not ref_frac or ref_frac <= 0 or frac is None:
+        return None
+    cov = max(0.0, min(1.0, 1.0 - float(frac) / float(ref_frac)))
+    CONDUCTOR.coverage = round(cov * 100.0, 1)
+    return CONDUCTOR.coverage
+
+
 async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[str],
                            folder: str, overhead: float) -> float:
     """Scatti di CALIBRAZIONE per trovare il tempo giusto della fase PRIMA di
@@ -821,3 +853,132 @@ async def _run(bridge: Bridge) -> None:
         CONDUCTOR.error = str(e)
         CONDUCTOR.phase = "aborted"
         CONDUCTOR.note(f"Errore: {e}")
+
+
+async def _run_session(bridge: Bridge, block_offsets: list, simulate: bool,
+                       sim_speed: float, cool, cool_temp, point_sun, point_moon) -> None:
+    """Sessione TEMPORIZZATA (timer 1° contatto): attende/rileva il primo contatto,
+    ancora la timeline e spara ogni fase alla sua finestra (offset in secondi dal
+    1° contatto). Reale: scatta e misura la % di ingresso ombra finché supera la
+    soglia → t0=ora. Simulazione: t0=ora, offset compressi di `sim_speed` (prova
+    la logica senza eclissi vera). Riusa arm/raffreddamento/calibrazione/keeper."""
+    plan = CONDUCTOR.plan
+    if not plan:
+        CONDUCTOR.phase = "aborted"
+        CONDUCTOR.session_phase = "done"
+        return
+    overhead = float(plan.get("overhead_sec", 1.5))
+    CONDUCTOR.session = True
+    CONDUCTOR.sim = bool(simulate)
+    try:
+        await _do_arm(bridge, point_sun=point_sun, point_moon=point_moon,
+                      cool=cool, cool_temp=cool_temp)
+        dev = CONDUCTOR.device
+        if CONDUCTOR.cool:
+            CONDUCTOR.phase = "cooling"
+            await _wait_for_temperature(bridge, dev, CONDUCTOR.cool_temp)
+            if CONDUCTOR.pending.get("abort"):
+                raise _Abort()
+
+        # --- 1° contatto ---
+        CONDUCTOR.session_phase = "waiting_contact"
+        eff0 = CONDUCTOR.last_good_eff or 0.002
+        if simulate:
+            CONDUCTOR.note("🕐 SIMULAZIONE: 1° contatto = ORA (timeline dall'orologio)")
+            CONDUCTOR.t0 = time.time()
+        else:
+            await _shoot_one(bridge, dev, eff0, overhead)  # riferimento disco pieno
+            snap = await bridge.state.snapshot()
+            ref_frac = (snap.get("last_frame") or {}).get("bright_frac")
+            CONDUCTOR.note(f"🕐 Attendo il 1° contatto (rif. disco pieno={ref_frac})…")
+            while True:
+                if CONDUCTOR.pending.get("abort"):
+                    raise _Abort()
+                cov = await _measure_coverage(bridge, dev, eff0, ref_frac, overhead)
+                CONDUCTOR.note(f"copertura: {cov}%")
+                if cov is not None and cov >= _FIRST_CONTACT_PCT:
+                    CONDUCTOR.t0 = time.time()
+                    CONDUCTOR.note(f"✅ 1° CONTATTO confermato (copertura {cov}%) → avvio timers")
+                    break
+                await asyncio.sleep(_CONTACT_POLL_SEC)
+
+        # --- esecuzione schedulata ---
+        CONDUCTOR.session_phase = "running"
+        CONDUCTOR.phase = "running"
+        speed = sim_speed if (simulate and sim_speed and sim_speed > 0) else 1.0
+        for i, blk in enumerate(plan["blocks"]):
+            if CONDUCTOR.pending.get("abort"):
+                raise _Abort()
+            off = (block_offsets[i] if i < len(block_offsets) else 0.0) / speed
+            CONDUCTOR.block_idx = i
+            CONDUCTOR.block_label = blk["label"]
+            while (time.time() - (CONDUCTOR.t0 or time.time())) < off:
+                if CONDUCTOR.pending.get("abort"):
+                    raise _Abort()
+                await asyncio.sleep(0.5)
+            base = CONDUCTOR.base_dir
+            folder = _phase_folder(blk.get("feature", ""), blk.get("label", ""))
+            if blk.get("priority", 9) <= 1:  # sicurezza (Baily/diamante): subito
+                if base:
+                    try:
+                        await _ensure_upload_local(bridge, dev, f"{base}/{folder}", f"{folder}_XXX")
+                    except Exception as e:  # noqa: BLE001
+                        CONDUCTOR.note(f"cartella fase warning: {e}")
+                CONDUCTOR.note(f"⏱ Fase {folder} @ +{off:.0f}s (sicurezza)")
+                await _fire_keepers(bridge, dev, blk, 1.0, overhead)
+            else:
+                CONDUCTOR.note(f"⏱ Fase {folder} @ +{off:.0f}s → calibro e sparo")
+                bias = await _calibrate_phase(bridge, dev, blk, base, folder, overhead)
+                if base:
+                    try:
+                        await _ensure_upload_local(bridge, dev, f"{base}/{folder}", f"{folder}_XXX")
+                    except Exception as e:  # noqa: BLE001
+                        CONDUCTOR.note(f"cartella fase warning: {e}")
+                await _fire_keepers(bridge, dev, blk, 2.0 ** bias, overhead)
+
+        CONDUCTOR.session_phase = "done"
+        CONDUCTOR.phase = "done"
+        CONDUCTOR.note(f"✅ Sessione completata: {CONDUCTOR.frames_shot} frame")
+    except (_Abort, asyncio.CancelledError):
+        CONDUCTOR.session_phase = "done"
+        CONDUCTOR.phase = "aborted"
+        CONDUCTOR.note("Sessione interrotta")
+    except Exception as e:  # noqa: BLE001
+        CONDUCTOR.error = str(e)
+        CONDUCTOR.session_phase = "done"
+        CONDUCTOR.phase = "aborted"
+        CONDUCTOR.note(f"Errore sessione: {e}")
+
+
+@router.post("/session")
+async def session_start(payload: dict = Body(default={}),
+                        bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Avvia una SESSIONE temporizzata (timer 1° contatto).
+    Body: block_offsets[] (secondi dal 1° contatto, uno per blocco del piano),
+    simulate (bool), sim_speed (compressione tempo in simulazione, es. 60),
+    cool/cool_temp, point_sun/point_moon. Richiede /plan già chiamato."""
+    if CONDUCTOR.plan is None:
+        raise HTTPException(status_code=409, detail="nessun piano: chiama /plan")
+    if CONDUCTOR.phase == "running":
+        raise HTTPException(status_code=409, detail="già in esecuzione")
+    offsets = [float(x) for x in (payload.get("block_offsets") or [])]
+    CONDUCTOR.pending = {}
+    CONDUCTOR.error = None
+    CONDUCTOR.frames_shot = 0
+    CONDUCTOR.calib_shot = 0
+    CONDUCTOR.block_idx = -1
+    CONDUCTOR.ev_bias_stops = 0.0
+    CONDUCTOR.last_good_eff = None
+    CONDUCTOR.coverage = None
+    CONDUCTOR.t0 = None
+    CONDUCTOR.started_at = time.monotonic()
+    CONDUCTOR.phase = "running"
+    CONDUCTOR.task = asyncio.ensure_future(_run_session(
+        bridge, offsets, bool(payload.get("simulate", False)),
+        float(payload.get("sim_speed", 60.0)),
+        payload.get("cool"), payload.get("cool_temp"),
+        payload.get("point_sun"), payload.get("point_moon")))
+    CONDUCTOR.note("Sessione SIMULATA avviata" if payload.get("simulate")
+                   else "Sessione avviata (attesa 1° contatto)")
+    return {"ok": True, "blocks": len(CONDUCTOR.plan["blocks"]),
+            "simulate": bool(payload.get("simulate", False))}

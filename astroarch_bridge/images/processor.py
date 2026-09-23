@@ -40,6 +40,7 @@ class ProcessResult:
     vmin: float
     vmax: float
     p999: float  # 99.9° percentile = luminosità del soggetto (disco), robusto al fondo
+    bright_frac: float  # frazione di frame "illuminata" (>0.5·p99.9) — per la % ingresso ombra
     hfr_approx: float
     star_count: int
     is_color: bool
@@ -318,6 +319,10 @@ def _process_array(raw: np.ndarray, header: dict, max_dim: int,
     # scuro, a differenza della mediana di tutto il frame. Usato per calibrare
     # l'esposizione nell'eclissi (conduttore).
     p999 = float(np.percentile(raw[finite], 99.9)) if finite.any() else 0.0
+    # frazione di frame "illuminata" = pixel sopra metà della luminosità del disco.
+    # Su disco pieno ≈ area del disco; man mano che l'ombra entra, cala → serve a
+    # misurare la % di ingresso dell'ombra (conduttore/timer eclissi).
+    bright_frac = float(np.mean(raw[finite] > 0.5 * p999)) if (finite.any() and p999 > 0) else 0.0
     hfr, n_stars = _estimate_stars(gray)
     img = _to_pil_image(rgb_u8)
     big = _resize_keep_aspect(img, max_dim)
@@ -330,6 +335,7 @@ def _process_array(raw: np.ndarray, header: dict, max_dim: int,
         jpeg=big_buf.getvalue(), thumbnail=thumb_buf.getvalue(),
         width=big.width, height=big.height,
         median=median, std=std, vmin=vmin, vmax=vmax, p999=p999,
+        bright_frac=bright_frac,
         hfr_approx=hfr, star_count=n_stars,
         is_color=is_color, bayer_pattern=str(bayer_pattern) if bayer_pattern else None,
         exposure=_safe_float(header.get("EXPTIME") or header.get("EXPOSURE")),
