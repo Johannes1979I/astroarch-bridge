@@ -43,7 +43,12 @@ _BIAS_STEP = 0.5
 # Calibrazione per-fase: prima di sparare i keeper, alcuni scatti di prova per
 # trovare il tempo giusto (così non si brucia l'intera fase con pose sbagliate).
 _MAX_PROBE = 4               # scatti di calibrazione massimi per fase
-_TARGET_MEDIAN_FRAC = 0.28   # mediana "buona" a cui puntare in calibrazione
+_TARGET_MEDIAN_FRAC = 0.28   # (legacy) mediana "buona" — non usata per il disco
+# La calibrazione usa il p99.9 (luminosità del DISCO), robusto al fondo scuro:
+# la mediana di tutto il frame è dominata dal cielo nero (Luna/Sole = disco su
+# fondo scuro) → sempre "dark". Il p99.9 misura invece il disco.
+_DARK_P999_FRAC = 0.35       # p99.9 sotto → disco troppo debole → aumenta
+_TARGET_P999_FRAC = 0.60     # p99.9 a cui puntare (disco ben esposto, no clip)
 
 
 class _Abort(Exception):
@@ -73,6 +78,7 @@ class _Conductor:
         self.auto_enabled: bool = True
         self.last_median: Optional[float] = None
         self.last_vmax: Optional[float] = None
+        self.last_p999: Optional[float] = None  # luminosità disco (calibrazione)
         self.pending: dict[str, Any] = {}
         self.logs: list[str] = []
         self.error: Optional[str] = None
@@ -98,6 +104,7 @@ class _Conductor:
             "auto_enabled": self.auto_enabled,
             "last_median": self.last_median,
             "last_vmax": self.last_vmax,
+            "last_p999": self.last_p999,
             "cooling": self.cool,
             "cool_temp": self.cool_temp,
             "last_temp": self.last_temp,
@@ -624,29 +631,47 @@ async def _wait_for_temperature(bridge: Bridge, dev: str, target: float,
     return False
 
 
-def _expo_verdict(median, vmax) -> str:
-    """Giudizio sull'esposizione dell'ultimo frame: 'clip' (satura),
-    'dark' (troppo scuro), 'ok' (dentro banda)."""
-    if vmax is not None and vmax / _MAX16 >= _SAT_LIMIT_FRAC:
+def _expo_verdict(p999, vmax) -> str:
+    """Giudizio esposizione basato sul **p99.9** (luminosità del disco), robusto
+    al fondo scuro (la mediana di tutto il frame è dominata dal cielo nero).
+    'clip' se il disco satura, 'dark' se troppo debole, 'ok' se in banda."""
+    x = (p999 or 0.0) / _MAX16
+    if x >= _SAT_LIMIT_FRAC:
         return "clip"
-    if median is not None and median / _MAX16 <= _DARK_MEDIAN_FRAC:
+    if x <= _DARK_P999_FRAC:
         return "dark"
     return "ok"
 
 
-async def _shoot_one(bridge: Bridge, dev: str, eff: float,
-                     overhead: float) -> tuple[Optional[float], Optional[float]]:
-    """Fa UNO scatto e ritorna (median, vmax) dell'ultimo frame (per l'analisi)."""
+async def _wait_new_frame(bridge: Bridge, ts0: float, timeout: float):
+    """Attende che arrivi e venga processato un frame NUOVO (last_frame.ts > ts0),
+    così le statistiche corrispondono alla posa appena fatta e non a quella prima.
+    Ritorna (median, vmax, p999). Best-effort: al timeout ritorna l'ultimo dato."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        snap = await bridge.state.snapshot()
+        lf = snap.get("last_frame") or {}
+        if (lf.get("ts") or 0.0) > ts0:
+            return lf.get("median"), lf.get("vmax"), lf.get("p999")
+        await asyncio.sleep(0.15)
+    snap = await bridge.state.snapshot()
+    lf = snap.get("last_frame") or {}
+    return lf.get("median"), lf.get("vmax"), lf.get("p999")
+
+
+async def _shoot_one(bridge: Bridge, dev: str, eff: float, overhead: float):
+    """Fa UNO scatto e ritorna (median, vmax, p999) del frame APPENA acquisito
+    (aspetta il BLOB nuovo via timestamp, così non legge il frame precedente)."""
     eff = _clamp(eff, 1.0 / 8000.0, 30.0)
+    snap0 = await bridge.state.snapshot()
+    ts0 = (snap0.get("last_frame") or {}).get("ts") or 0.0
     await bridge.indi.send_number(dev, "CCD_EXPOSURE", {"CCD_EXPOSURE_VALUE": eff})
     ok = await _wait_exposure(bridge, dev, eff, eff + overhead + 8.0)
     if not ok:
         CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
-    snap = await bridge.state.snapshot()
-    lf = snap.get("last_frame") or {}
-    m, v = lf.get("median"), lf.get("vmax")
-    CONDUCTOR.last_median, CONDUCTOR.last_vmax = m, v
-    return m, v
+    m, v, p = await _wait_new_frame(bridge, ts0, overhead + 10.0)
+    CONDUCTOR.last_median, CONDUCTOR.last_vmax, CONDUCTOR.last_p999 = m, v, p
+    return m, v, p
 
 
 async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[str],
@@ -671,21 +696,27 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
         if CONDUCTOR.pending.get("abort"):
             raise _Abort()
         eff = _clamp(nominal * (2.0 ** bias), 1.0 / 8000.0, 30.0)
-        m, v = await _shoot_one(bridge, dev, eff, overhead)
+        m, v, p = await _shoot_one(bridge, dev, eff, overhead)
         CONDUCTOR.calib_shot += 1
-        verdict = _expo_verdict(m, v)
+        verdict = _expo_verdict(p, v)  # giudizio sul DISCO (p99.9), non sul fondo
         CONDUCTOR.note(
-            f"  prova #{attempt + 1}: {eff:.4f}s → {verdict} (median={m}, vmax={v})")
+            f"  prova #{attempt + 1}: {eff:.4f}s → {verdict} "
+            f"(disco {100 * (p or 0) / _MAX16:.0f}%, p99.9={p}, max={v})")
         if verdict == "ok":
             CONDUCTOR.note(f"✅ {folder}: tempo giusto ≈ {eff:.4f}s (bias {bias:+.1f})")
             break
         if verdict == "clip":
-            bias = _clamp(bias - 1.0, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)  # satura → −1 stop
-        else:  # dark: stima gli stop necessari per portare la mediana in banda
+            # disco satura: stima gli stop da togliere per riportarlo al target
+            need = 1.0
+            if p and p > 0:
+                need = _clamp(math.log2((p or 1.0) / (_TARGET_P999_FRAC * _MAX16)),
+                              _BIAS_STEP, 3.0)
+            bias = _clamp(bias - need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
+        else:  # dark: stima gli stop per portare il disco (p99.9) al target
             need = _BIAS_STEP
-            if m and m > 0:
-                need = _clamp(math.log2((_TARGET_MEDIAN_FRAC * _MAX16) / max(m, 1.0)),
-                              _BIAS_STEP, 2.0)
+            if p and p > 0:
+                need = _clamp(math.log2((_TARGET_P999_FRAC * _MAX16) / max(p, 1.0)),
+                              _BIAS_STEP, 3.0)
             bias = _clamp(bias + need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
     else:
         CONDUCTOR.note(f"⚠️ {folder}: calibrazione non perfetta, uso bias {bias:+.1f}")

@@ -121,6 +121,7 @@ def create_app() -> FastAPI:
             "median": result.median,
             "vmin": result.vmin,
             "vmax": result.vmax,
+            "p999": result.p999,
             "hfr": result.hfr_approx,
             "stars": result.star_count,
             "is_color": result.is_color,
