@@ -344,9 +344,17 @@ def _compute_contacts(date: str, lat: float, lon: float) -> dict:
         tot_sec = int(round((c3 - c2).to(u.s).value))
 
     sun_max = fsun[jmax]
+    # Copertura massima al culmine: magnitudine (frazione del diametro) e % area.
+    d_min = float(fsep[jmax])
+    rs = float(fsun_r[jmax])
+    rm = float(fmoon_r[jmax])
+    magnitude = max(0.0, (rs + rm - d_min) / (2.0 * rs))
+    coverage = _obscuration(d_min, rs, rm)
     return {
         "visible": True,
         "type": "total" if c2 is not None else "partial",
+        "magnitude": round(magnitude, 3),
+        "coverage_pct": round(coverage * 100.0, 1),
         "c1": hhmmss(tc[i1]),
         "c2": hhmmss(c2) if c2 is not None else None,
         "max": hhmmss(tf[jmax]),
@@ -359,6 +367,22 @@ def _compute_contacts(date: str, lat: float, lon: float) -> dict:
         },
         "note": "Calcolo astropy (topocentrico). Verifica/correggi sul campo.",
     }
+
+
+def _obscuration(d: float, r_sun: float, r_moon: float) -> float:
+    """Frazione dell'area del disco solare oscurata (0-1), date le distanze
+    angolari (separazione d e raggi apparenti r_sun/r_moon, stesse unità)."""
+    import math
+    if d >= r_sun + r_moon:
+        return 0.0
+    if d <= abs(r_moon - r_sun):
+        return 1.0 if r_moon >= r_sun else (r_moon / r_sun) ** 2
+    d2, rs2, rm2 = d * d, r_sun * r_sun, r_moon * r_moon
+    a_sun = math.acos((d2 + rs2 - rm2) / (2 * d * r_sun))
+    a_moon = math.acos((d2 + rm2 - rs2) / (2 * d * r_moon))
+    area = rs2 * (a_sun - math.sin(2 * a_sun) / 2) + \
+        rm2 * (a_moon - math.sin(2 * a_moon) / 2)
+    return max(0.0, min(1.0, area / (math.pi * rs2)))
 
 
 def _sun_radec_now() -> tuple[float, float]:
