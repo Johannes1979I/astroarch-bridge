@@ -42,7 +42,7 @@ _MAX_BIAS_STOPS = 3.0
 _BIAS_STEP = 0.5
 # Calibrazione per-fase: prima di sparare i keeper, alcuni scatti di prova per
 # trovare il tempo giusto (così non si brucia l'intera fase con pose sbagliate).
-_MAX_PROBE = 4               # scatti di calibrazione massimi per fase
+_MAX_PROBE = 7               # scatti di calibrazione massimi per fase
 _TARGET_MEDIAN_FRAC = 0.28   # (legacy) mediana "buona" — non usata per il disco
 # La calibrazione usa il p99.9 (luminosità del DISCO), robusto al fondo scuro:
 # la mediana di tutto il frame è dominata dal cielo nero (Luna/Sole = disco su
@@ -79,6 +79,7 @@ class _Conductor:
         self.last_median: Optional[float] = None
         self.last_vmax: Optional[float] = None
         self.last_p999: Optional[float] = None  # luminosità disco (calibrazione)
+        self.last_good_eff: Optional[float] = None  # ultima posa "ok" (seme fase dopo)
         self.pending: dict[str, Any] = {}
         self.logs: list[str] = []
         self.error: Optional[str] = None
@@ -683,7 +684,14 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
     NON tra gli scatti buoni."""
     exps = blk["exposures"]
     nominal = exps[len(exps) // 2]  # esposizione rappresentativa del bracket
-    bias = CONDUCTOR.ev_bias_stops  # parti dalla stima corrente (fasi precedenti)
+    # Parti dall'esposizione BUONA della fase precedente (se c'è): stessa camera
+    # e condizioni simili → converge subito, anche se il bracket di questa fase
+    # ha un nominale molto diverso. Altrimenti dalla stima corrente del bias.
+    if CONDUCTOR.last_good_eff and CONDUCTOR.last_good_eff > 0:
+        bias = _clamp(math.log2(CONDUCTOR.last_good_eff / max(nominal, 1e-9)),
+                      -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
+    else:
+        bias = CONDUCTOR.ev_bias_stops
     if base:
         try:
             await _ensure_upload_local(
@@ -703,12 +711,14 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
             f"  prova #{attempt + 1}: {eff:.4f}s → {verdict} "
             f"(disco {100 * (p or 0) / _MAX16:.0f}%, p99.9={p}, max={v})")
         if verdict == "ok":
+            CONDUCTOR.last_good_eff = eff  # seme per la fase successiva
             CONDUCTOR.note(f"✅ {folder}: tempo giusto ≈ {eff:.4f}s (bias {bias:+.1f})")
             break
         if verdict == "clip":
-            # disco satura: stima gli stop da togliere per riportarlo al target
-            need = 1.0
-            if p and p > 0:
+            if (p or 0) >= _MAX16 * 0.999:
+                # completamente saturo: non so DI QUANTO è oltre → passo deciso
+                need = 2.0
+            else:
                 need = _clamp(math.log2((p or 1.0) / (_TARGET_P999_FRAC * _MAX16)),
                               _BIAS_STEP, 3.0)
             bias = _clamp(bias - need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
