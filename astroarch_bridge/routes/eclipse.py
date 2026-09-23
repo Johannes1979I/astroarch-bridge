@@ -105,6 +105,19 @@ async def status() -> dict:
     return CONDUCTOR.snapshot()
 
 
+@router.get("/contacts")
+async def contacts(date: str, lat: float, lon: float) -> dict:
+    """Contatti C1-C4 + posizione del Sole per il GPS dato (calcolo astropy,
+    separazione topocentrica Sole-Luna). Best-effort: da correggere sul campo.
+    date = YYYY-MM-DD (UT)."""
+    try:
+        return await asyncio.to_thread(_compute_contacts, date, float(lat), float(lon))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"calcolo contatti fallito: {e}")
+
+
 @router.post("/plan")
 async def set_plan(
     payload: dict = Body(...),
@@ -248,6 +261,75 @@ async def stop(bridge: Bridge = Depends(get_bridge)) -> dict:
 
 
 # ---------------------------------------------------------------- interni
+
+def _compute_contacts(date: str, lat: float, lon: float) -> dict:
+    """Calcola i contatti dell'eclissi via astropy (separazione topocentrica
+    Sole-Luna) per l'osservatore a (lat, lon). Ritorna orari UT + Sole a max."""
+    import numpy as np
+    from astropy.time import Time
+    from astropy.coordinates import EarthLocation, AltAz, get_body, get_sun
+    import astropy.units as u
+
+    loc = EarthLocation(lat=lat * u.deg, lon=lon * u.deg, height=0 * u.m)
+
+    def sep_radii(times):
+        frame = AltAz(obstime=times, location=loc)
+        sun = get_sun(times).transform_to(frame)
+        moon = get_body("moon", times).transform_to(frame)
+        sep = sun.separation(moon).deg
+        sun_r = (959.63 / sun.distance.to(u.au).value) / 3600.0  # deg
+        moon_r = np.degrees(np.arctan(1737.4 / moon.distance.to(u.km).value))
+        return sep, sun_r, moon_r, sun
+
+    def hhmmss(t) -> str:
+        return t.utc.iso[11:19] + " UT"
+
+    # Scansione grezza sul giorno (1 min) per trovare max + C1/C4.
+    t0 = Time(f"{date}T00:00:00", scale="utc")
+    n = 24 * 60
+    tc = t0 + np.arange(n) * u.min
+    sep, sun_r, moon_r, _ = sep_radii(tc)
+    ext = sun_r + moon_r          # contatto esterno (C1/C4)
+    partial = sep <= ext
+    if not bool(partial.any()):
+        return {"visible": False,
+                "note": "Eclissi non visibile da questa posizione."}
+    i1 = int(np.argmax(partial))
+    i4 = int(n - 1 - np.argmax(partial[::-1]))
+    imax = int(np.argmin(sep))
+
+    # Scansione fine attorno al massimo (±20 min a 1 s) per max + C2/C3.
+    fn = 40 * 60 + 1
+    tf = tc[imax] + np.linspace(-1200, 1200, fn) * u.s
+    fsep, fsun_r, fmoon_r, fsun = sep_radii(tf)
+    finte = np.abs(fmoon_r - fsun_r)   # contatto interno (C2/C3)
+    jmax = int(np.argmin(fsep))
+    ftotal = fsep <= finte
+    c2 = c3 = None
+    tot_sec = None
+    if bool(ftotal.any()):
+        j2 = int(np.argmax(ftotal))
+        j3 = int(fn - 1 - np.argmax(ftotal[::-1]))
+        c2, c3 = tf[j2], tf[j3]
+        tot_sec = int(round((c3 - c2).to(u.s).value))
+
+    sun_max = fsun[jmax]
+    return {
+        "visible": True,
+        "type": "total" if c2 is not None else "partial",
+        "c1": hhmmss(tc[i1]),
+        "c2": hhmmss(c2) if c2 is not None else None,
+        "max": hhmmss(tf[jmax]),
+        "c3": hhmmss(c3) if c3 is not None else None,
+        "c4": hhmmss(tc[i4]),
+        "totality_sec": tot_sec,
+        "sun": {
+            "alt": round(float(sun_max.alt.deg), 2),
+            "az": round(float(sun_max.az.deg), 2),
+        },
+        "note": "Calcolo astropy (topocentrico). Verifica/correggi sul campo.",
+    }
+
 
 async def _apply_gain_offset(bridge: Bridge, dev: str,
                              gain: Any, offset: Any) -> None:
