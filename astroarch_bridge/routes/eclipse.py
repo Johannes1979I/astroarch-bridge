@@ -118,6 +118,17 @@ async def contacts(date: str, lat: float, lon: float) -> dict:
         raise HTTPException(status_code=500, detail=f"calcolo contatti fallito: {e}")
 
 
+@router.post("/point_sun")
+async def point_sun_route(bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Punta subito la montatura sul Sole (posizione attuale) + tracking solare.
+    Azione esplicita (usata dalla spunta dell'app / test)."""
+    try:
+        mdev, ra, dec = await _point_sun(bridge)
+        return {"ok": True, "mount": mdev, "ra_hours": round(ra, 4), "dec_deg": round(dec, 3)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"punta Sole fallito: {e}")
+
+
 @router.post("/plan")
 async def set_plan(
     payload: dict = Body(...),
@@ -153,6 +164,7 @@ async def set_plan(
         "offset": payload.get("offset"),
         "overhead_sec": float(payload.get("overhead_sec", 1.5)),
         "totality_sec": payload.get("totality_sec"),
+        "point_sun": bool(payload.get("point_sun", False)),
     }
     CONDUCTOR.device = payload.get("device")
     CONDUCTOR.frames_total = total
@@ -162,10 +174,28 @@ async def set_plan(
 
 
 @router.post("/arm")
-async def arm(bridge: Bridge = Depends(get_bridge)) -> dict:
-    """Prepara la camera: UPLOAD_MODE=BOTH+dir, BLOB attivo, frame LIGHT, gain/offset."""
+async def arm(payload: dict = Body(default={}), bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Prepara: (opz.) punta il Sole, UPLOAD_MODE=BOTH+dir, BLOB, frame LIGHT, gain/offset.
+    `point_sun` (bool) attiva l'autopuntamento del Sole — scelta dell'utente."""
+    return await _do_arm(bridge, point_sun=payload.get("point_sun"))
+
+
+async def _do_arm(bridge: Bridge, point_sun: bool | None = None) -> dict:
     if CONDUCTOR.plan is None:
         raise HTTPException(status_code=409, detail="nessun piano: chiama /plan")
+
+    # Autopuntamento del Sole — SOLO se richiesto (spunta nell'app). Di notte
+    # (test Luna) resta spento, così non si slew verso il Sole per errore.
+    do_point = bool(point_sun) if point_sun is not None \
+        else bool((CONDUCTOR.plan or {}).get("point_sun"))
+    if do_point:
+        try:
+            mdev, ra, dec = await _point_sun(bridge)
+            CONDUCTOR.note(
+                f"Puntato il Sole: {mdev} RA={ra:.3f}h Dec={dec:.2f}° + tracking solare")
+        except Exception as e:  # noqa: BLE001
+            CONDUCTOR.note(f"punta Sole warning: {e}")
+
     dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
     CONDUCTOR.device = dev
 
@@ -209,7 +239,7 @@ async def start(bridge: Bridge = Depends(get_bridge)) -> dict:
     if CONDUCTOR.phase not in ("armed", "planned", "done", "aborted"):
         raise HTTPException(status_code=409, detail=f"stato non valido: {CONDUCTOR.phase}")
     if CONDUCTOR.phase != "armed":
-        await arm(bridge)  # auto-arm se non fatto
+        await _do_arm(bridge)  # auto-arm se non fatto (usa point_sun del piano)
 
     CONDUCTOR.pending = {}
     CONDUCTOR.error = None
@@ -329,6 +359,32 @@ def _compute_contacts(date: str, lat: float, lon: float) -> dict:
         },
         "note": "Calcolo astropy (topocentrico). Verifica/correggi sul campo.",
     }
+
+
+def _sun_radec_now() -> tuple[float, float]:
+    """RA (ore) / Dec (gradi) apparenti del Sole ADESSO, equinozio di data (JNow)."""
+    from astropy.time import Time
+    from astropy.coordinates import get_sun, FK5
+    t = Time.now()
+    s = get_sun(t).transform_to(FK5(equinox=t))
+    return float(s.ra.hour), float(s.dec.deg)
+
+
+async def _point_sun(bridge: Bridge):
+    """Slew della montatura sul Sole (posizione attuale) + inseguimento solare."""
+    mdev = await resolve_device(bridge.state, "mount", None)
+    ra, dec = await asyncio.to_thread(_sun_radec_now)
+    await bridge.indi.send_switch(
+        mdev, "ON_COORD_SET", {"SLEW": False, "TRACK": True, "SYNC": False})
+    await bridge.indi.send_number(mdev, "EQUATORIAL_EOD_COORD", {"RA": ra, "DEC": dec})
+    try:
+        await bridge.indi.send_switch(mdev, "TELESCOPE_TRACK_MODE", {
+            "TRACK_SIDEREAL": False, "TRACK_LUNAR": False,
+            "TRACK_SOLAR": True, "TRACK_CUSTOM": False,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return mdev, ra, dec
 
 
 async def _apply_gain_offset(bridge: Bridge, dev: str,
