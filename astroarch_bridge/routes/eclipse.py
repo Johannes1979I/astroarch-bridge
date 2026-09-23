@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -39,6 +40,10 @@ _SAT_LIMIT_FRAC = 0.97   # oltre → sta clippando → riduci
 _DARK_MEDIAN_FRAC = 0.12  # sotto → troppo scuro → aumenta
 _MAX_BIAS_STOPS = 3.0
 _BIAS_STEP = 0.5
+# Calibrazione per-fase: prima di sparare i keeper, alcuni scatti di prova per
+# trovare il tempo giusto (così non si brucia l'intera fase con pose sbagliate).
+_MAX_PROBE = 4               # scatti di calibrazione massimi per fase
+_TARGET_MEDIAN_FRAC = 0.28   # mediana "buona" a cui puntare in calibrazione
 
 
 class _Abort(Exception):
@@ -61,6 +66,7 @@ class _Conductor:
         self.cool_temp: float = -10.0
         self.last_temp: Optional[float] = None  # temperatura camera letta
         self.frames_shot: int = 0
+        self.calib_shot: int = 0  # scatti di calibrazione (non keeper)
         self.frames_total: int = 0
         self.started_at: float = 0.0
         self.ev_bias_stops: float = 0.0
@@ -95,6 +101,7 @@ class _Conductor:
             "cooling": self.cool,
             "cool_temp": self.cool_temp,
             "last_temp": self.last_temp,
+            "calib_shot": self.calib_shot,
             "error": self.error,
             "logs": self.logs[-30:],
         }
@@ -303,6 +310,7 @@ async def start(bridge: Bridge = Depends(get_bridge)) -> dict:
     CONDUCTOR.pending = {}
     CONDUCTOR.error = None
     CONDUCTOR.frames_shot = 0
+    CONDUCTOR.calib_shot = 0
     CONDUCTOR.block_idx = -1
     CONDUCTOR.ev_bias_stops = 0.0
     CONDUCTOR.started_at = time.monotonic()
@@ -562,6 +570,89 @@ async def _wait_for_temperature(bridge: Bridge, dev: str, target: float,
     return False
 
 
+def _expo_verdict(median, vmax) -> str:
+    """Giudizio sull'esposizione dell'ultimo frame: 'clip' (satura),
+    'dark' (troppo scuro), 'ok' (dentro banda)."""
+    if vmax is not None and vmax / _MAX16 >= _SAT_LIMIT_FRAC:
+        return "clip"
+    if median is not None and median / _MAX16 <= _DARK_MEDIAN_FRAC:
+        return "dark"
+    return "ok"
+
+
+async def _shoot_one(bridge: Bridge, dev: str, eff: float,
+                     overhead: float) -> tuple[Optional[float], Optional[float]]:
+    """Fa UNO scatto e ritorna (median, vmax) dell'ultimo frame (per l'analisi)."""
+    eff = _clamp(eff, 1.0 / 8000.0, 30.0)
+    await bridge.indi.send_number(dev, "CCD_EXPOSURE", {"CCD_EXPOSURE_VALUE": eff})
+    ok = await _wait_exposure(bridge, dev, eff, eff + overhead + 8.0)
+    if not ok:
+        CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
+    snap = await bridge.state.snapshot()
+    lf = snap.get("last_frame") or {}
+    m, v = lf.get("median"), lf.get("vmax")
+    CONDUCTOR.last_median, CONDUCTOR.last_vmax = m, v
+    return m, v
+
+
+async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[str],
+                           folder: str, overhead: float) -> float:
+    """Scatti di CALIBRAZIONE per trovare il tempo giusto della fase PRIMA di
+    sparare i keeper — così non si brucia l'intera fase con pose sbagliate
+    (es. 20 scatti di corona tutti neri). Ritorna il bias EV (in stop) da
+    applicare al bracket. I frame di prova vanno in Eclissi/<fase>/_calib/,
+    NON tra gli scatti buoni."""
+    exps = blk["exposures"]
+    nominal = exps[len(exps) // 2]  # esposizione rappresentativa del bracket
+    bias = CONDUCTOR.ev_bias_stops  # parti dalla stima corrente (fasi precedenti)
+    if base:
+        try:
+            await _ensure_upload_local(
+                bridge, dev, f"{base}/{folder}/_calib", f"calib_{folder}_XXX")
+        except Exception:  # noqa: BLE001
+            pass
+    CONDUCTOR.phase = "calibrating"
+    CONDUCTOR.note(f"🎯 Calibrazione {folder}: cerco il tempo giusto…")
+    for attempt in range(_MAX_PROBE):
+        if CONDUCTOR.pending.get("abort"):
+            raise _Abort()
+        eff = _clamp(nominal * (2.0 ** bias), 1.0 / 8000.0, 30.0)
+        m, v = await _shoot_one(bridge, dev, eff, overhead)
+        CONDUCTOR.calib_shot += 1
+        verdict = _expo_verdict(m, v)
+        CONDUCTOR.note(
+            f"  prova #{attempt + 1}: {eff:.4f}s → {verdict} (median={m}, vmax={v})")
+        if verdict == "ok":
+            CONDUCTOR.note(f"✅ {folder}: tempo giusto ≈ {eff:.4f}s (bias {bias:+.1f})")
+            break
+        if verdict == "clip":
+            bias = _clamp(bias - 1.0, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)  # satura → −1 stop
+        else:  # dark: stima gli stop necessari per portare la mediana in banda
+            need = _BIAS_STEP
+            if m and m > 0:
+                need = _clamp(math.log2((_TARGET_MEDIAN_FRAC * _MAX16) / max(m, 1.0)),
+                              _BIAS_STEP, 2.0)
+            bias = _clamp(bias + need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
+    else:
+        CONDUCTOR.note(f"⚠️ {folder}: calibrazione non perfetta, uso bias {bias:+.1f}")
+    CONDUCTOR.ev_bias_stops = bias
+    return bias
+
+
+async def _fire_keepers(bridge: Bridge, dev: str, blk: dict, mult: float,
+                        overhead: float) -> None:
+    """Spara gli scatti BUONI della fase al tempo corretto (×mult), salvati nella
+    cartella della fase. Rispetta abort/skip."""
+    for expo in blk["exposures"]:
+        for _ in range(blk["shots"]):
+            if CONDUCTOR.pending.get("abort"):
+                raise _Abort()
+            if CONDUCTOR.pending.pop("skip", False):
+                return
+            await _shoot_one(bridge, dev, expo * mult, overhead)
+            CONDUCTOR.frames_shot += 1
+
+
 async def _run(bridge: Bridge) -> None:
     dev = CONDUCTOR.device
     plan = CONDUCTOR.plan
@@ -586,43 +677,42 @@ async def _run(bridge: Bridge) -> None:
                 CONDUCTOR.note(f"Salto blocco: {blk['label']}")
                 continue
 
-            is_safety = blk.get("priority", 9) <= 1  # Baily/diamante
-            mult = 1.0 if is_safety else (2.0 ** CONDUCTOR.ev_bias_stops)
-            CONDUCTOR.note(f"Blocco {i + 1}: {blk['label']} (×{mult:.2f})")
-
+            is_safety = blk.get("priority", 9) <= 1  # Baily/diamante: tempo-critici
+            base = CONDUCTOR.base_dir
             # Sottocartella della fase: <images_dir>/Eclissi/<fase>/ — raggruppa
             # perfettamente per fase (corona, baily, cromosfera, protuberanze, ...).
-            base = CONDUCTOR.base_dir
+            folder = _phase_folder(blk.get("feature", ""), blk.get("label", ""))
+
+            if is_safety:
+                # Baily/diamante: NIENTE calibrazione (durano pochi secondi, pose
+                # pre-calcolate e blindate). Si spara subito nella cartella fase.
+                CONDUCTOR.phase = "running"
+                if base:
+                    try:
+                        await _ensure_upload_local(
+                            bridge, dev, f"{base}/{folder}", f"{folder}_XXX")
+                    except Exception as e:  # noqa: BLE001
+                        CONDUCTOR.note(f"cartella fase warning: {e}")
+                CONDUCTOR.note(f"Blocco {i + 1}: {blk['label']} (sicurezza, ×1.00)")
+                await _fire_keepers(bridge, dev, blk, 1.0, overhead)
+                continue
+
+            # 1) CALIBRAZIONE: trova il tempo giusto della fase (prove in _calib/),
+            #    così se il tempo pianificato è sbagliato non si perde l'intera fase.
+            CONDUCTOR.note(f"Blocco {i + 1}: {blk['label']}")
+            bias = await _calibrate_phase(bridge, dev, blk, base, folder, overhead)
+            if CONDUCTOR.pending.get("abort"):
+                raise _Abort()
+            # 2) KEEPER: spara la sequenza al tempo corretto, salvando SOLO i buoni.
+            CONDUCTOR.phase = "running"
             if base:
-                folder = _phase_folder(blk.get("feature", ""), blk.get("label", ""))
                 try:
                     await _ensure_upload_local(
                         bridge, dev, f"{base}/{folder}", f"{folder}_XXX")
-                    CONDUCTOR.note(f"→ Eclissi/{folder}/")
+                    CONDUCTOR.note(f"→ Eclissi/{folder}/ (×{2.0 ** bias:.2f})")
                 except Exception as e:  # noqa: BLE001
                     CONDUCTOR.note(f"cartella fase warning: {e}")
-
-            for expo in blk["exposures"]:
-                for _ in range(blk["shots"]):
-                    if CONDUCTOR.pending.get("abort"):
-                        raise _Abort()
-                    if CONDUCTOR.pending.pop("skip", False):
-                        break
-                    eff = _clamp(expo * mult, 1.0 / 8000.0, 30.0)
-                    await bridge.indi.send_number(
-                        dev, "CCD_EXPOSURE", {"CCD_EXPOSURE_VALUE": eff})
-                    ok = await _wait_exposure(bridge, dev, eff, eff + overhead + 8.0)
-                    CONDUCTOR.frames_shot += 1
-                    if not ok:
-                        CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
-                    # stat ultimo frame (per auto-loop)
-                    snap = await bridge.state.snapshot()
-                    lf = snap.get("last_frame") or {}
-                    CONDUCTOR.last_median = lf.get("median")
-                    CONDUCTOR.last_vmax = lf.get("vmax")
-
-            if not is_safety:
-                _auto_adjust()
+            await _fire_keepers(bridge, dev, blk, 2.0 ** bias, overhead)
 
         CONDUCTOR.phase = "done"
         CONDUCTOR.note(f"Completato: {CONDUCTOR.frames_shot} frame")
