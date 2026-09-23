@@ -55,6 +55,20 @@ async def devices(bridge: Bridge = Depends(get_bridge)) -> dict:
     return {"devices": await bridge.state.list_devices()}
 
 
+# Modelli inequivocabilmente da GUIDA (piccoli sensori, camere su guidino).
+_GUIDE_TOKENS = (
+    "guide", "guider", "mini", "gpcmos",
+    "asi120", "asi174", "asi178", "asi220", "asi224", "asi290",
+    "asi385", "asi462", "asi482", "asi585", "asi678", "qhy5",
+)
+# Modelli inequivocabilmente da IMAGING (sensori grandi / camere raffreddate).
+_MAIN_TOKENS = (
+    "atr", "asi2600", "asi6200", "asi2400", "asi294", "asi071", "asi533",
+    "imx455", "imx571", "imx533", "imx294",
+    "2600", "6200", "full frame", "full-frame",
+)
+
+
 @router.get("/camera_roles")
 async def camera_roles(bridge: Bridge = Depends(get_bridge)) -> dict:
     """Identifica la camera primaria (imaging) e quella di guida.
@@ -125,6 +139,30 @@ async def camera_roles(bridge: Bridge = Depends(get_bridge)) -> dict:
         primary = cameras[0]
         guide = None
         method = "single"
+
+    # --- Correzione finale per MODELLO (i nomi camera sono inequivocabili) ---
+    # Ekos/PHD2 a volte riportano la guida sbagliata (es. profilo Ekos con la
+    # ToupTek ATR2600C impostata come guider): se per nome una camera è
+    # chiaramente una GUIDA e un'altra chiaramente una IMAGING, imponiamo quel
+    # ruolo, sovrascrivendo l'euristica precedente. Se i nomi non bastano,
+    # lasciamo la scelta di prima (conservativo, non peggiora nulla).
+    def _is_guide_name(cl: str) -> bool:
+        return any(k in cl for k in _GUIDE_TOKENS)
+
+    def _is_main_name(cl: str) -> bool:
+        return any(k in cl for k in _MAIN_TOKENS)
+
+    g_by_name = next(
+        (c for c in cameras
+         if _is_guide_name(c.lower()) and not _is_main_name(c.lower())), None)
+    m_by_name = next(
+        (c for c in cameras
+         if _is_main_name(c.lower()) and not _is_guide_name(c.lower())), None)
+    if g_by_name and m_by_name and g_by_name != m_by_name:
+        if guide != g_by_name or primary != m_by_name:
+            method = "name-override"
+        guide = g_by_name
+        primary = m_by_name
 
     return {
         "cameras": cameras,

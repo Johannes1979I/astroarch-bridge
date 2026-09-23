@@ -56,6 +56,9 @@ class _Conductor:
         self.task: Optional[asyncio.Task] = None
         self.block_idx: int = -1
         self.block_label: Optional[str] = None
+        self.base_dir: Optional[str] = None  # <images_dir>/Eclissi (cartella madre)
+        self.cool: bool = False
+        self.cool_temp: float = -10.0
         self.frames_shot: int = 0
         self.frames_total: int = 0
         self.started_at: float = 0.0
@@ -98,6 +101,26 @@ CONDUCTOR = _Conductor()
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _phase_folder(feature_key: str, label: str = "") -> str:
+    """Sottocartella (dentro 'Eclissi/') in cui salvare gli scatti di una fase.
+    Le corone (interna/media/esterna) confluiscono tutte in 'corona', come da
+    richiesta utente ("tutti gli scatti della corona vanno nella cartella corona").
+    Fallback sull'etichetta se la feature non è nota."""
+    k = (feature_key or "").lower().replace("_", "-")
+    text = f"{k} {label.lower()}"
+    if "corona" in text or k == "totality":
+        return "corona"
+    if "baily" in text or "diamond" in text or "diamante" in text or "perle" in text:
+        return "baily"
+    if "chromo" in text or "cromosfera" in text:
+        return "cromosfera"
+    if "promin" in text or "protuberanz" in text:
+        return "protuberanze"
+    if "partial" in text or "parzial" in text:
+        return "parziale"
+    return "varie"
 
 
 @router.get("/status")
@@ -147,6 +170,7 @@ async def set_plan(
         shots = max(1, int(b.get("shots", 1)))
         blk = {
             "label": str(b.get("label", "?")),
+            "feature": str(b.get("feature", "")),
             "exposures": expos,
             "shots": shots,
             "priority": int(b.get("priority", 9)),
@@ -175,12 +199,20 @@ async def set_plan(
 
 @router.post("/arm")
 async def arm(payload: dict = Body(default={}), bridge: Bridge = Depends(get_bridge)) -> dict:
-    """Prepara: (opz.) punta il Sole, UPLOAD_MODE=BOTH+dir, BLOB, frame LIGHT, gain/offset.
-    `point_sun` (bool) attiva l'autopuntamento del Sole — scelta dell'utente."""
-    return await _do_arm(bridge, point_sun=payload.get("point_sun"))
+    """Prepara: (opz.) punta il Sole, (opz.) raffredda la camera, UPLOAD_MODE=BOTH,
+    cartella madre 'Eclissi/', BLOB, frame LIGHT, gain/offset.
+    `point_sun` (bool) → autopuntamento del Sole; `cool` (bool) + `cool_temp` (°C,
+    default -10) → raffreddamento camera. Tutte scelte dell'utente."""
+    return await _do_arm(
+        bridge,
+        point_sun=payload.get("point_sun"),
+        cool=payload.get("cool"),
+        cool_temp=payload.get("cool_temp"),
+    )
 
 
-async def _do_arm(bridge: Bridge, point_sun: bool | None = None) -> dict:
+async def _do_arm(bridge: Bridge, point_sun: bool | None = None,
+                  cool: bool | None = None, cool_temp: float | None = None) -> dict:
     if CONDUCTOR.plan is None:
         raise HTTPException(status_code=409, detail="nessun piano: chiama /plan")
 
@@ -199,12 +231,15 @@ async def _do_arm(bridge: Bridge, point_sun: bool | None = None) -> dict:
     dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
     CONDUCTOR.device = dev
 
-    # Upload BOTH + cartella dedicata (così il bridge riceve il BLOB per l'auto-loop
-    # E i FITS sono salvati su disco).
+    # Upload BOTH + cartella madre "Eclissi/" DENTRO la cartella scelta da Ekos
+    # (settings.images_dir). Il bridge riceve il BLOB per l'auto-loop E i FITS
+    # sono salvati su disco. Gli scatti di ogni fase finiranno nelle sottocartelle
+    # Eclissi/<fase>/ impostate blocco per blocco in _run().
     from ..config import get_settings
     settings = get_settings()
-    target_dir = str(settings.images_dir / "Eclipse")
-    await _ensure_upload_local(bridge, dev, target_dir, "ECL_XXX")
+    base_dir = str(settings.images_dir / "Eclissi")
+    CONDUCTOR.base_dir = base_dir
+    await _ensure_upload_local(bridge, dev, base_dir, "ECL_XXX")
     try:
         await bridge.indi.enable_blob(dev, "Also")
     except Exception as e:  # noqa: BLE001
@@ -223,10 +258,30 @@ async def _do_arm(bridge: Bridge, point_sun: bool | None = None) -> dict:
     await _apply_gain_offset(bridge, dev,
                              CONDUCTOR.plan.get("gain"), CONDUCTOR.plan.get("offset"))
 
+    # Raffreddamento camera — SOLO se richiesto (spunta nell'app). Default -10°C.
+    # Impostiamo il target: la camera scende da sola; non blocchiamo l'arm in
+    # attesa (in eclissi non c'è tempo). L'utente arma in anticipo.
+    do_cool = bool(cool) if cool is not None \
+        else bool((CONDUCTOR.plan or {}).get("cool")) or CONDUCTOR.cool
+    if do_cool:
+        t = float(cool_temp) if cool_temp is not None \
+            else float((CONDUCTOR.plan or {}).get("cool_temp") or CONDUCTOR.cool_temp)
+        CONDUCTOR.cool = True
+        CONDUCTOR.cool_temp = t
+        try:
+            await bridge.indi.send_switch(dev, "CCD_COOLER",
+                                          {"COOLER_ON": True, "COOLER_OFF": False})
+            await bridge.indi.send_number(dev, "CCD_TEMPERATURE",
+                                          {"CCD_TEMPERATURE_VALUE": t})
+            CONDUCTOR.note(f"Raffreddamento ON, target {t:.0f}°C")
+        except Exception as e:  # noqa: BLE001
+            CONDUCTOR.note(f"raffreddamento warning: {e}")
+
     CONDUCTOR.phase = "armed"
     CONDUCTOR.note(f"Armato su {dev}")
     _, gain_prop, gain_elt = await _resolve_gain(bridge, dev)
-    return {"ok": True, "device": dev, "upload_dir": target_dir,
+    return {"ok": True, "device": dev, "upload_dir": base_dir,
+            "cooling": CONDUCTOR.cool, "cool_temp": CONDUCTOR.cool_temp,
             "gain_property": gain_prop, "gain_element": gain_elt}
 
 
@@ -493,6 +548,18 @@ async def _run(bridge: Bridge) -> None:
             is_safety = blk.get("priority", 9) <= 1  # Baily/diamante
             mult = 1.0 if is_safety else (2.0 ** CONDUCTOR.ev_bias_stops)
             CONDUCTOR.note(f"Blocco {i + 1}: {blk['label']} (×{mult:.2f})")
+
+            # Sottocartella della fase: <images_dir>/Eclissi/<fase>/ — raggruppa
+            # perfettamente per fase (corona, baily, cromosfera, protuberanze, ...).
+            base = CONDUCTOR.base_dir
+            if base:
+                folder = _phase_folder(blk.get("feature", ""), blk.get("label", ""))
+                try:
+                    await _ensure_upload_local(
+                        bridge, dev, f"{base}/{folder}", f"{folder}_XXX")
+                    CONDUCTOR.note(f"→ Eclissi/{folder}/")
+                except Exception as e:  # noqa: BLE001
+                    CONDUCTOR.note(f"cartella fase warning: {e}")
 
             for expo in blk["exposures"]:
                 for _ in range(blk["shots"]):
