@@ -38,7 +38,10 @@ router = APIRouter(
 _MAX16 = 65535.0
 _SAT_LIMIT_FRAC = 0.97   # oltre → sta clippando → riduci
 _DARK_MEDIAN_FRAC = 0.12  # sotto → troppo scuro → aumenta
-_MAX_BIAS_STOPS = 3.0
+_MAX_BIAS_STOPS = 15.0  # ampio: la posa reale è comunque limitata a 1/8000–30s.
+# Serve perché il bracket di una fase (es. totale = Luna rossa, pose lunghe) può
+# essere lontanissimo dall'esposizione giusta su un bersaglio diverso (Luna piena
+# in test) → la calibrazione deve poter scendere/salire di molti stop.
 _BIAS_STEP = 0.5
 # Calibrazione per-fase: prima di sparare i keeper, alcuni scatti di prova per
 # trovare il tempo giusto (così non si brucia l'intera fase con pose sbagliate).
