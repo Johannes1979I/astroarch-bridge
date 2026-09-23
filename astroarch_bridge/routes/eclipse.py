@@ -121,6 +121,14 @@ def _phase_folder(feature_key: str, label: str = "") -> str:
     Fallback sull'etichetta se la feature non è nota."""
     k = (feature_key or "").lower().replace("_", "-")
     text = f"{k} {label.lower()}"
+    # Fasi di eclissi di LUNA (chiavi lunar-*): penombra / parziale / totalita.
+    if k.startswith("lunar-"):
+        if "penumbr" in k:
+            return "penombra"
+        if "total" in k:
+            return "totalita"
+        if "partial" in k:
+            return "parziale"
     if "corona" in text or k == "totality":
         return "corona"
     if "baily" in text or "diamond" in text or "diamante" in text or "perle" in text:
@@ -140,11 +148,16 @@ async def status() -> dict:
 
 
 @router.get("/contacts")
-async def contacts(date: str, lat: float, lon: float) -> dict:
-    """Contatti C1-C4 + posizione del Sole per il GPS dato (calcolo astropy,
-    separazione topocentrica Sole-Luna). Best-effort: da correggere sul campo.
-    date = YYYY-MM-DD (UT)."""
+async def contacts(date: str, lat: float, lon: float, kind: str = "solar") -> dict:
+    """Contatti + posizione del corpo per il GPS dato (calcolo astropy).
+    `kind=solar` (default) → C1-C4 + Sole (separazione topocentrica Sole-Luna).
+    `kind=lunar` → P1/U1/U2/max/U3/U4/P4 + visibilità della Luna (ombra terrestre).
+    date = YYYY-MM-DD (UT). Best-effort: da correggere sul campo."""
     try:
+        if kind == "lunar":
+            from ..eclipse_shadow import compute_lunar_contacts
+            return await asyncio.to_thread(
+                compute_lunar_contacts, date, float(lat), float(lon))
         return await asyncio.to_thread(_compute_contacts, date, float(lat), float(lon))
     except HTTPException:
         raise
@@ -161,6 +174,17 @@ async def point_sun_route(bridge: Bridge = Depends(get_bridge)) -> dict:
         return {"ok": True, "mount": mdev, "ra_hours": round(ra, 4), "dec_deg": round(dec, 3)}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"punta Sole fallito: {e}")
+
+
+@router.post("/point_moon")
+async def point_moon_route(bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Punta subito la montatura sulla Luna (posizione attuale) + tracking lunare.
+    Usata dalla spunta dell'app in modalità Luna / test."""
+    try:
+        mdev, ra, dec = await _point_moon(bridge)
+        return {"ok": True, "mount": mdev, "ra_hours": round(ra, 4), "dec_deg": round(dec, 3)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"punta Luna fallito: {e}")
 
 
 @router.post("/plan")
@@ -200,6 +224,7 @@ async def set_plan(
         "overhead_sec": float(payload.get("overhead_sec", 1.5)),
         "totality_sec": payload.get("totality_sec"),
         "point_sun": bool(payload.get("point_sun", False)),
+        "point_moon": bool(payload.get("point_moon", False)),
     }
     CONDUCTOR.device = payload.get("device")
     CONDUCTOR.frames_total = total
@@ -217,21 +242,32 @@ async def arm(payload: dict = Body(default={}), bridge: Bridge = Depends(get_bri
     return await _do_arm(
         bridge,
         point_sun=payload.get("point_sun"),
+        point_moon=payload.get("point_moon"),
         cool=payload.get("cool"),
         cool_temp=payload.get("cool_temp"),
     )
 
 
 async def _do_arm(bridge: Bridge, point_sun: bool | None = None,
+                  point_moon: bool | None = None,
                   cool: bool | None = None, cool_temp: float | None = None) -> dict:
     if CONDUCTOR.plan is None:
         raise HTTPException(status_code=409, detail="nessun piano: chiama /plan")
 
-    # Autopuntamento del Sole — SOLO se richiesto (spunta nell'app). Di notte
-    # (test Luna) resta spento, così non si slew verso il Sole per errore.
-    do_point = bool(point_sun) if point_sun is not None \
+    # Autopuntamento — SOLO se richiesto (spunta nell'app). Luna (test/eclissi di
+    # Luna) ha precedenza sul Sole; entrambi spenti = niente slew (default sicuro).
+    do_sun = bool(point_sun) if point_sun is not None \
         else bool((CONDUCTOR.plan or {}).get("point_sun"))
-    if do_point:
+    do_moon = bool(point_moon) if point_moon is not None \
+        else bool((CONDUCTOR.plan or {}).get("point_moon"))
+    if do_moon:
+        try:
+            mdev, ra, dec = await _point_moon(bridge)
+            CONDUCTOR.note(
+                f"Puntata la Luna: {mdev} RA={ra:.3f}h Dec={dec:.2f}° + tracking lunare")
+        except Exception as e:  # noqa: BLE001
+            CONDUCTOR.note(f"punta Luna warning: {e}")
+    elif do_sun:
         try:
             mdev, ra, dec = await _point_sun(bridge)
             CONDUCTOR.note(
@@ -472,6 +508,24 @@ async def _point_sun(bridge: Bridge):
         await bridge.indi.send_switch(mdev, "TELESCOPE_TRACK_MODE", {
             "TRACK_SIDEREAL": False, "TRACK_LUNAR": False,
             "TRACK_SOLAR": True, "TRACK_CUSTOM": False,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return mdev, ra, dec
+
+
+async def _point_moon(bridge: Bridge):
+    """Slew della montatura sulla Luna (posizione attuale) + inseguimento lunare."""
+    from ..eclipse_shadow import moon_radec_now
+    mdev = await resolve_device(bridge.state, "mount", None)
+    ra, dec = await asyncio.to_thread(moon_radec_now)
+    await bridge.indi.send_switch(
+        mdev, "ON_COORD_SET", {"SLEW": False, "TRACK": True, "SYNC": False})
+    await bridge.indi.send_number(mdev, "EQUATORIAL_EOD_COORD", {"RA": ra, "DEC": dec})
+    try:
+        await bridge.indi.send_switch(mdev, "TELESCOPE_TRACK_MODE", {
+            "TRACK_SIDEREAL": False, "TRACK_LUNAR": True,
+            "TRACK_SOLAR": False, "TRACK_CUSTOM": False,
         })
     except Exception:  # noqa: BLE001
         pass
