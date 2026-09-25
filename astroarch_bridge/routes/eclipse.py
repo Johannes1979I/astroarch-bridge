@@ -679,16 +679,23 @@ async def _optics_from_kstars_db(camera_name: str) -> tuple[float, float]:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             cur = con.cursor()
-            row = cur.execute(
+            # Scope dei train con QUESTA camera. Se più d'uno (es. la stessa
+            # camera è anche nel train di guida, come su EQ8), preferisci lo
+            # scope NON di guida → il tele di imaging, non la guida.
+            mine = [r[0] for r in cur.execute(
                 "SELECT scope FROM opticaltrains "
-                "WHERE camera=? AND scope IS NOT NULL AND scope!='--' LIMIT 1",
-                (camera_name,)).fetchone()
-            if row and row[0]:
-                return row[0]
+                "WHERE camera=? AND scope IS NOT NULL AND scope!='--'",
+                (camera_name,)).fetchall() if r[0]]
+            for s in mine:
+                if "guide" not in s.lower():
+                    return s
+            if mine:
+                return mine[0]
+            # Fallback (camera non trovata): primo scope non di guida nel DB.
             for (s,) in cur.execute(
                     "SELECT scope FROM opticaltrains WHERE scope IS NOT NULL"):
                 if s and s != "--" and "guide" not in s.lower():
-                    return s  # fallback: primo scope non di guida
+                    return s
         except Exception:  # noqa: BLE001
             return None
         finally:
