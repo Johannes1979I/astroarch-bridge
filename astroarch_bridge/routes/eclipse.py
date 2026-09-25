@@ -46,6 +46,9 @@ _BIAS_STEP = 0.5
 # Calibrazione per-fase: prima di sparare i keeper, alcuni scatti di prova per
 # trovare il tempo giusto (così non si brucia l'intera fase con pose sbagliate).
 _MAX_PROBE = 7               # scatti di calibrazione massimi per fase
+_SHORT_EXPOSURE_SEC = 0.05   # sotto questa posa non si attende la transizione
+# "Busy" (troppo rapida da campionare → falsi timeout): ci si affida al solo
+# timestamp del frame nuovo.
 _TARGET_MEDIAN_FRAC = 0.28   # (legacy) mediana "buona" — non usata per il disco
 # La calibrazione usa il p99.9 (luminosità del DISCO), robusto al fondo scuro:
 # la mediana di tutto il frame è dominata dal cielo nero (Luna/Sole = disco su
@@ -910,10 +913,14 @@ async def _shoot_one(bridge: Bridge, dev: str, eff: float, overhead: float):
     snap0 = await bridge.state.snapshot()
     ts0 = (snap0.get("last_frame") or {}).get("ts") or 0.0
     await bridge.indi.send_number(dev, "CCD_EXPOSURE", {"CCD_EXPOSURE_VALUE": eff})
-    ok = await _wait_exposure(bridge, dev, eff, eff + overhead + 8.0)
-    if not ok:
-        CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
-    m, v, p = await _wait_new_frame(bridge, ts0, overhead + 10.0)
+    # Pose lunghe: attendi la fine esposizione (Busy→Ok). Pose brevi: la
+    # transizione Busy è troppo rapida da campionare (dava falsi timeout) →
+    # salta e affidati SOLO al timestamp del frame nuovo.
+    if eff >= _SHORT_EXPOSURE_SEC:
+        ok = await _wait_exposure(bridge, dev, eff, eff + overhead + 8.0)
+        if not ok:
+            CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
+    m, v, p = await _wait_new_frame(bridge, ts0, eff + overhead + 10.0)
     CONDUCTOR.last_median, CONDUCTOR.last_vmax, CONDUCTOR.last_p999 = m, v, p
     # bianco adattivo: se un frame supera la stima dei bit, alza il livello di
     # bianco (robusto anche se il driver dichiara i bit in modo scorretto).
@@ -1000,14 +1007,31 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
 async def _fire_keepers(bridge: Bridge, dev: str, blk: dict, mult: float,
                         overhead: float) -> None:
     """Spara gli scatti BUONI della fase al tempo corretto (×mult), salvati nella
-    cartella della fase. Rispetta abort/skip."""
-    for expo in blk["exposures"]:
+    cartella della fase. Rispetta abort/skip.
+    Salva SOLO i tempi CORRETTI: dal bracket (×mult) tiene le pose previste ben
+    esposte sul disco e SCARTA quelle che saturerebbero o resterebbero troppo
+    scure (previsione lineare dal p99.9 misurato in calibrazione). I blocchi di
+    SICUREZZA (Baily/diamante, priority≤1) NON si filtrano: pose blindate."""
+    white = CONDUCTOR.white or _MAX16
+    eff_cal = CONDUCTOR.last_good_eff or 0.0
+    p999_cal = CONDUCTOR.last_p999 or 0.0
+    is_safety = blk.get("priority", 9) <= 1
+    exposures = [e * mult for e in blk["exposures"]]
+    if not is_safety and eff_cal > 0 and p999_cal > 0:
+        good = [e for e in exposures
+                if _DARK_P999_FRAC <= (p999_cal * e / eff_cal) / white <= _SAT_LIMIT_FRAC]
+        exposures = good or [eff_cal]  # fallback: almeno il tempo calibrato
+        if len(exposures) < len(blk["exposures"]):
+            CONDUCTOR.note(
+                f"  keeper: {len(exposures)}/{len(blk['exposures'])} pose in banda "
+                f"(scarto le sovra/sotto-esposte)")
+    for expo in exposures:
         for _ in range(blk["shots"]):
             if CONDUCTOR.pending.get("abort"):
                 raise _Abort()
             if CONDUCTOR.pending.pop("skip", False):
                 return
-            await _shoot_one(bridge, dev, expo * mult, overhead)
+            await _shoot_one(bridge, dev, expo, overhead)
             CONDUCTOR.frames_shot += 1
 
 
