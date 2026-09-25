@@ -371,6 +371,17 @@ async def _do_arm(bridge: Bridge, point_sun: bool | None = None,
     except Exception:  # noqa: BLE001
         pass
 
+    # Binning: l'eclissi scatta a PIENA RISOLUZIONE (bin 1x1) per il massimo
+    # dettaglio/campionamento, a prescindere dal bin lasciato prima sulla camera
+    # (es. bin2 usato per il plate solving). Override opzionale dal piano.
+    try:
+        b = int((CONDUCTOR.plan or {}).get("binning") or 1)
+        b = max(1, min(b, 4))
+        await bridge.indi.send_number(dev, "CCD_BINNING", {"HOR_BIN": b, "VER_BIN": b})
+        CONDUCTOR.note(f"Binning {b}x{b}" + (" (piena risoluzione)" if b == 1 else ""))
+    except Exception as e:  # noqa: BLE001
+        CONDUCTOR.note(f"binning warning: {e}")
+
     # Gain/Offset dal piano (uno per tutto il piano, come dall'app).
     await _apply_gain_offset(bridge, dev,
                              CONDUCTOR.plan.get("gain"), CONDUCTOR.plan.get("offset"))
