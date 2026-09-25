@@ -69,6 +69,9 @@ class _Conductor:
         self.phase: str = "idle"  # idle|planned|armed|running|done|aborted
         self.plan: Optional[dict] = None
         self.device: Optional[str] = None
+        # --- Auto-taratura (qualunque camera) ---
+        self.white: float = _MAX16     # livello di bianco = 2^bit−1 rilevato
+        self.rig: dict[str, Any] = {}  # camera+telescopio rilevati da INDI
         self.task: Optional[asyncio.Task] = None
         self.block_idx: int = -1
         self.block_label: Optional[str] = None
@@ -118,6 +121,8 @@ class _Conductor:
             "last_median": self.last_median,
             "last_vmax": self.last_vmax,
             "last_p999": self.last_p999,
+            "white": self.white,
+            "rig": self.rig,
             "cooling": self.cool,
             "cool_temp": self.cool_temp,
             "last_temp": self.last_temp,
@@ -213,6 +218,22 @@ async def point_moon_route(bridge: Bridge = Depends(get_bridge)) -> dict:
         raise HTTPException(status_code=500, detail=f"punta Luna fallito: {e}")
 
 
+@router.get("/rig")
+async def rig_route(bridge: Bridge = Depends(get_bridge)) -> dict:
+    """Rileva camera + telescopio (auto-taratura). L'app lo usa per precompilare
+    pixel/focale/f-ratio/gain nel pianificatore (con override manuale) e per
+    conoscere il livello di bianco reale del sensore."""
+    try:
+        dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
+        rig = await _detect_rig(bridge, dev)
+        if rig.get("white"):
+            CONDUCTOR.white = float(rig["white"])  # coerente anche fuori dall'arm
+        CONDUCTOR.rig = rig
+        return {"ok": True, "rig": rig, "white": CONDUCTOR.white}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"rilevamento rig fallito: {e}")
+
+
 @router.post("/plan")
 async def set_plan(
     payload: dict = Body(...),
@@ -303,6 +324,26 @@ async def _do_arm(bridge: Bridge, point_sun: bool | None = None,
 
     dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
     CONDUCTOR.device = dev
+
+    # --- Auto-taratura: rileva camera+telescopio e imposta il livello di bianco.
+    try:
+        CONDUCTOR.rig = await _detect_rig(bridge, dev)
+        if CONDUCTOR.rig.get("white"):
+            CONDUCTOR.white = float(CONDUCTOR.rig["white"])
+            det = f"{CONDUCTOR.rig.get('bits')} bit → bianco {CONDUCTOR.white:.0f}"
+            if CONDUCTOR.rig.get("pixel_um"):
+                det += f", pixel {CONDUCTOR.rig['pixel_um']}µm"
+            if CONDUCTOR.rig.get("f_ratio"):
+                det += f", f/{CONDUCTOR.rig['f_ratio']}"
+            if CONDUCTOR.rig.get("image_scale_arcsec_px"):
+                det += f", {CONDUCTOR.rig['image_scale_arcsec_px']}\"/px"
+            CONDUCTOR.note(f"🎛 Auto-taratura: {det}")
+        else:
+            CONDUCTOR.white = _MAX16
+            CONDUCTOR.note("🎛 Auto-taratura: bit non rilevati, uso bianco 65535 (default)")
+    except Exception as e:  # noqa: BLE001
+        CONDUCTOR.white = _MAX16
+        CONDUCTOR.note(f"auto-taratura warning: {e} (uso bianco 65535)")
 
     # Upload BOTH + cartella madre "Eclissi/" DENTRO la cartella scelta da Ekos
     # (settings.images_dir). Il bridge riceve il BLOB per l'auto-loop E i FITS
@@ -578,6 +619,57 @@ async def _apply_gain_offset(bridge: Bridge, dev: str,
             pass
 
 
+async def _detect_rig(bridge: Bridge, dev: str) -> dict:
+    """Rileva i parametri REALI di camera + telescopio da INDI → auto-taratura.
+    Così il modulo Eclissi si adatta a QUALSIASI camera invece di assumere 65535:
+      - CCD_INFO: bit/pixel → livello di bianco; dim. pixel (µm); risoluzione.
+      - TELESCOPE_INFO (montatura): focale (mm), apertura (mm) → f/ e scala "/px.
+      - gain corrente (CCD_GAIN / CCD_CONTROLS).
+    Best-effort: ogni campo mancante resta assente e si usano i default."""
+    rig: dict[str, Any] = {"device": dev}
+    info = await bridge.state.get_property(dev, "CCD_INFO") or {}
+    bits = first_element(info, "CCD_BITSPERPIXEL", None)
+    pixel_um = first_element(info, "CCD_PIXEL_SIZE", None) \
+        or first_element(info, "CCD_PIXEL_SIZE_X", None)
+    max_x = first_element(info, "CCD_MAX_X", None)
+    max_y = first_element(info, "CCD_MAX_Y", None)
+    if bits:
+        b = int(round(float(bits)))
+        rig["bits"] = b
+        rig["white"] = float(2 ** b - 1)
+    if pixel_um:
+        rig["pixel_um"] = round(float(pixel_um), 3)
+    if max_x and max_y:
+        rig["resolution"] = [int(float(max_x)), int(float(max_y))]
+
+    # TELESCOPE_INFO di norma è sulla MONTATURA, non sulla camera.
+    tinfo = await bridge.state.get_property(dev, "TELESCOPE_INFO") or {}
+    if not tinfo.get("elements"):
+        try:
+            mdev = await resolve_device(bridge.state, "mount", None)
+            tinfo = await bridge.state.get_property(mdev, "TELESCOPE_INFO") or {}
+        except Exception:  # noqa: BLE001
+            tinfo = {}
+    fl = first_element(tinfo, "TELESCOPE_FOCAL_LENGTH", None)
+    ap = first_element(tinfo, "TELESCOPE_APERTURE", None)
+    if fl:
+        rig["focal_length_mm"] = round(float(fl), 1)
+    if ap:
+        rig["aperture_mm"] = round(float(ap), 1)
+    if fl and ap and float(ap) > 0:
+        rig["f_ratio"] = round(float(fl) / float(ap), 2)
+    if fl and pixel_um and float(fl) > 0:
+        rig["image_scale_arcsec_px"] = round(206.265 * float(pixel_um) / float(fl), 3)
+
+    try:
+        gval, _gp, _ge = await _resolve_gain(bridge, dev)
+        if gval is not None:
+            rig["gain"] = round(float(gval), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return rig
+
+
 async def _wait_exposure(bridge: Bridge, dev: str, exposure: float,
                          timeout: float) -> bool:
     """Attende il completamento dell'esposizione (stato CCD_EXPOSURE != Busy)."""
@@ -612,9 +704,10 @@ def _auto_adjust() -> None:
     vmax = CONDUCTOR.last_vmax
     median = CONDUCTOR.last_median
     old = CONDUCTOR.ev_bias_stops
-    if vmax is not None and vmax / _MAX16 >= _SAT_LIMIT_FRAC:
+    white = CONDUCTOR.white or _MAX16
+    if vmax is not None and vmax / white >= _SAT_LIMIT_FRAC:
         CONDUCTOR.ev_bias_stops = _clamp(old - _BIAS_STEP, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
-    elif median is not None and median / _MAX16 <= _DARK_MEDIAN_FRAC:
+    elif median is not None and median / white <= _DARK_MEDIAN_FRAC:
         CONDUCTOR.ev_bias_stops = _clamp(old + _BIAS_STEP, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
     if CONDUCTOR.ev_bias_stops != old:
         CONDUCTOR.note(
@@ -655,8 +748,10 @@ async def _wait_for_temperature(bridge: Bridge, dev: str, target: float,
 def _expo_verdict(p999, vmax) -> str:
     """Giudizio esposizione basato sul **p99.9** (luminosità del disco), robusto
     al fondo scuro (la mediana di tutto il frame è dominata dal cielo nero).
-    'clip' se il disco satura, 'dark' se troppo debole, 'ok' se in banda."""
-    x = (p999 or 0.0) / _MAX16
+    'clip' se il disco satura, 'dark' se troppo debole, 'ok' se in banda.
+    Il livello di bianco è quello RILEVATO dalla camera (auto-taratura), non 65535
+    fisso → funziona con sensori a 8/12/14/16 bit."""
+    x = (p999 or 0.0) / (CONDUCTOR.white or _MAX16)
     if x >= _SAT_LIMIT_FRAC:
         return "clip"
     if x <= _DARK_P999_FRAC:
@@ -692,6 +787,10 @@ async def _shoot_one(bridge: Bridge, dev: str, eff: float, overhead: float):
         CONDUCTOR.note(f"⚠️ timeout su posa {eff:.4f}s")
     m, v, p = await _wait_new_frame(bridge, ts0, overhead + 10.0)
     CONDUCTOR.last_median, CONDUCTOR.last_vmax, CONDUCTOR.last_p999 = m, v, p
+    # bianco adattivo: se un frame supera la stima dei bit, alza il livello di
+    # bianco (robusto anche se il driver dichiara i bit in modo scorretto).
+    if v is not None and float(v) > CONDUCTOR.white:
+        CONDUCTOR.white = float(v)
     return m, v, p
 
 
@@ -719,6 +818,7 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
     NON tra gli scatti buoni."""
     exps = blk["exposures"]
     nominal = exps[len(exps) // 2]  # esposizione rappresentativa del bracket
+    white = CONDUCTOR.white or _MAX16  # bianco RILEVATO (auto-taratura)
     # Parti dall'esposizione BUONA della fase precedente (se c'è): stessa camera
     # e condizioni simili → converge subito, anche se il bracket di questa fase
     # ha un nominale molto diverso. Altrimenti dalla stima corrente del bias.
@@ -744,23 +844,23 @@ async def _calibrate_phase(bridge: Bridge, dev: str, blk: dict, base: Optional[s
         verdict = _expo_verdict(p, v)  # giudizio sul DISCO (p99.9), non sul fondo
         CONDUCTOR.note(
             f"  prova #{attempt + 1}: {eff:.4f}s → {verdict} "
-            f"(disco {100 * (p or 0) / _MAX16:.0f}%, p99.9={p}, max={v})")
+            f"(disco {100 * (p or 0) / white:.0f}%, p99.9={p}, max={v})")
         if verdict == "ok":
             CONDUCTOR.last_good_eff = eff  # seme per la fase successiva
             CONDUCTOR.note(f"✅ {folder}: tempo giusto ≈ {eff:.4f}s (bias {bias:+.1f})")
             break
         if verdict == "clip":
-            if (p or 0) >= _MAX16 * 0.999:
+            if (p or 0) >= white * 0.999:
                 # completamente saturo: non so DI QUANTO è oltre → passo deciso
                 need = 2.0
             else:
-                need = _clamp(math.log2((p or 1.0) / (_TARGET_P999_FRAC * _MAX16)),
+                need = _clamp(math.log2((p or 1.0) / (_TARGET_P999_FRAC * white)),
                               _BIAS_STEP, 3.0)
             bias = _clamp(bias - need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
         else:  # dark: stima gli stop per portare il disco (p99.9) al target
             need = _BIAS_STEP
             if p and p > 0:
-                need = _clamp(math.log2((_TARGET_P999_FRAC * _MAX16) / max(p, 1.0)),
+                need = _clamp(math.log2((_TARGET_P999_FRAC * white) / max(p, 1.0)),
                               _BIAS_STEP, 3.0)
             bias = _clamp(bias + need, -_MAX_BIAS_STOPS, _MAX_BIAS_STOPS)
     else:
