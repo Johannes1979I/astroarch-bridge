@@ -224,7 +224,7 @@ async def rig_route(bridge: Bridge = Depends(get_bridge)) -> dict:
     pixel/focale/f-ratio/gain nel pianificatore (con override manuale) e per
     conoscere il livello di bianco reale del sensore."""
     try:
-        dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
+        dev = await _resolve_camera(bridge)  # camera IMAGING (robusto con più camere)
         rig = await _detect_rig(bridge, dev)
         if rig.get("white"):
             CONDUCTOR.white = float(rig["white"])  # coerente anche fuori dall'arm
@@ -322,7 +322,7 @@ async def _do_arm(bridge: Bridge, point_sun: bool | None = None,
         except Exception as e:  # noqa: BLE001
             CONDUCTOR.note(f"punta Sole warning: {e}")
 
-    dev = await resolve_device(bridge.state, "camera", CONDUCTOR.device)
+    dev = await _resolve_camera(bridge)  # camera IMAGING (robusto con più camere)
     CONDUCTOR.device = dev
 
     # --- Auto-taratura: rileva camera+telescopio e imposta il livello di bianco.
@@ -617,6 +617,34 @@ async def _apply_gain_offset(bridge: Bridge, dev: str,
             await bridge.indi.send_number(dev, "CCD_OFFSET", {"OFFSET": float(offset)})
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _resolve_camera(bridge: Bridge) -> str:
+    """Risolve la camera PRINCIPALE (imaging) per l'eclissi.
+    Con più camere connesse (tipico: guida + imaging) NON fallisce come il
+    resolver generico (che darebbe 'multiple camera devices'): usa camera_roles
+    (Ekos/PHD2/euristica nomi/modello) per scegliere la camera di IMAGING.
+    Rispetta un override già scelto (CONDUCTOR.device) se ancora connesso."""
+    if CONDUCTOR.device:
+        try:
+            if CONDUCTOR.device in await bridge.state.list_devices():
+                return CONDUCTOR.device
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from .system import camera_roles
+        roles = await camera_roles(bridge)
+        primary = roles.get("primary")
+        if primary:
+            if roles.get("guide"):
+                CONDUCTOR.note(
+                    f"Camera imaging = {primary} "
+                    f"(guida {roles.get('guide')}, metodo {roles.get('method')})")
+            return primary
+    except Exception as e:  # noqa: BLE001
+        CONDUCTOR.note(f"camera_roles warning: {e}")
+    # Fallback: resolver generico (una sola camera connessa).
+    return await resolve_device(bridge.state, "camera", CONDUCTOR.device)
 
 
 async def _detect_rig(bridge: Bridge, dev: str) -> dict:
