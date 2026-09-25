@@ -647,6 +647,65 @@ async def _resolve_camera(bridge: Bridge) -> str:
     return await resolve_device(bridge.state, "camera", CONDUCTOR.device)
 
 
+async def _optics_from_ekos_dbus() -> tuple[float, float]:
+    """Focale+apertura (mm) dall'optical train ATTIVO di Ekos via DBus, quando
+    KStars è in esecuzione. `telescopeInfo` → [focale, apertura, f]."""
+    try:
+        from .align import _dbus_call_literal, _parse_dbus_array
+        raw = await _dbus_call_literal(
+            "/KStars/Ekos/Align", "org.kde.kstars.Ekos.Align.telescopeInfo")
+        vals = _parse_dbus_array(raw)
+        if len(vals) >= 2 and vals[0] > 0:
+            return float(vals[0]), (float(vals[1]) if vals[1] > 0 else 0.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0, 0.0
+
+
+async def _optics_from_kstars_db(camera_name: str) -> tuple[float, float]:
+    """Focale+apertura (mm) dai PROFILI Ekos nel DB di KStars
+    (~/.local/share/kstars/userdb.sqlite): l'optical train la cui `camera` è
+    quella di imaging → campo `scope` ('Vendor Model FL@F/ratio'). Persiste
+    anche a KStars/Ekos SPENTI (fonte usata quando né INDI né il DBus danno le
+    ottiche, tipico setup INDI-only)."""
+    import os
+    import re
+    import sqlite3
+    db = os.path.expanduser("~/.local/share/kstars/userdb.sqlite")
+    if not os.path.exists(db):
+        return 0.0, 0.0
+
+    def _read() -> Optional[str]:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            row = cur.execute(
+                "SELECT scope FROM opticaltrains "
+                "WHERE camera=? AND scope IS NOT NULL AND scope!='--' LIMIT 1",
+                (camera_name,)).fetchone()
+            if row and row[0]:
+                return row[0]
+            for (s,) in cur.execute(
+                    "SELECT scope FROM opticaltrains WHERE scope IS NOT NULL"):
+                if s and s != "--" and "guide" not in s.lower():
+                    return s  # fallback: primo scope non di guida
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            con.close()
+        return None
+
+    scope = await asyncio.to_thread(_read)
+    if not scope:
+        return 0.0, 0.0
+    m = re.search(r"([\d.]+)\s*@\s*[Ff]/\s*([\d.]+)", scope)
+    if m:
+        focal = float(m.group(1))
+        ratio = float(m.group(2))
+        return focal, (focal / ratio if ratio > 0 else 0.0)
+    return 0.0, 0.0
+
+
 async def _detect_rig(bridge: Bridge, dev: str) -> dict:
     """Rileva i parametri REALI di camera + telescopio da INDI → auto-taratura.
     Così il modulo Eclissi si adatta a QUALSIASI camera invece di assumere 65535:
@@ -670,7 +729,13 @@ async def _detect_rig(bridge: Bridge, dev: str) -> dict:
     if max_x and max_y:
         rig["resolution"] = [int(float(max_x)), int(float(max_y))]
 
-    # TELESCOPE_INFO di norma è sulla MONTATURA, non sulla camera.
+    # --- Ottiche (focale, apertura, f) — importate dai PROFILI Ekos ---
+    # 1) INDI TELESCOPE_INFO (montatura, se il driver la popola);
+    # 2) Ekos DBus telescopeInfo (optical train attivo, se KStars è in esecuzione);
+    # 3) DB KStars userdb.sqlite via optical train della camera (persiste a KStars
+    #    SPENTO — il driver montatura, es. LX200 OnStep, spesso non ha le ottiche).
+    fl = ap = 0.0
+    src: Optional[str] = None
     tinfo = await bridge.state.get_property(dev, "TELESCOPE_INFO") or {}
     if not tinfo.get("elements"):
         try:
@@ -678,16 +743,27 @@ async def _detect_rig(bridge: Bridge, dev: str) -> dict:
             tinfo = await bridge.state.get_property(mdev, "TELESCOPE_INFO") or {}
         except Exception:  # noqa: BLE001
             tinfo = {}
-    fl = first_element(tinfo, "TELESCOPE_FOCAL_LENGTH", None)
-    ap = first_element(tinfo, "TELESCOPE_APERTURE", None)
-    if fl:
-        rig["focal_length_mm"] = round(float(fl), 1)
-    if ap:
-        rig["aperture_mm"] = round(float(ap), 1)
-    if fl and ap and float(ap) > 0:
-        rig["f_ratio"] = round(float(fl) / float(ap), 2)
-    if fl and pixel_um and float(fl) > 0:
-        rig["image_scale_arcsec_px"] = round(206.265 * float(pixel_um) / float(fl), 3)
+    _fl = first_element(tinfo, "TELESCOPE_FOCAL_LENGTH", None)
+    _ap = first_element(tinfo, "TELESCOPE_APERTURE", None)
+    if _fl and float(_fl) > 0:
+        fl, ap, src = float(_fl), float(_ap or 0), "indi"
+    if fl <= 0:
+        efl, eap = await _optics_from_ekos_dbus()
+        if efl > 0:
+            fl, ap, src = efl, eap, "ekos-dbus"
+    if fl <= 0:
+        dfl, dap = await _optics_from_kstars_db(dev)
+        if dfl > 0:
+            fl, ap, src = dfl, dap, "ekos-db"
+    if fl > 0:
+        rig["focal_length_mm"] = round(fl, 1)
+        rig["optics_source"] = src
+    if ap > 0:
+        rig["aperture_mm"] = round(ap, 1)
+    if fl > 0 and ap > 0:
+        rig["f_ratio"] = round(fl / ap, 2)
+    if fl > 0 and pixel_um:
+        rig["image_scale_arcsec_px"] = round(206.265 * float(pixel_um) / fl, 3)
 
     try:
         gval, _gp, _ge = await _resolve_gain(bridge, dev)
