@@ -778,6 +778,23 @@ async def _detect_rig(bridge: Bridge, dev: str) -> dict:
             rig["gain"] = round(float(gval), 1)
     except Exception:  # noqa: BLE001
         pass
+    # Offset corrente (come impostato in Ekos): CCD_OFFSET.OFFSET oppure
+    # CCD_CONTROLS.Offset (ZWO/ToupTek usano spesso CCD_CONTROLS).
+    try:
+        off = None
+        po = await bridge.state.get_property(dev, "CCD_OFFSET")
+        if po:
+            off = first_element(po, "OFFSET", None)
+        if off is None:
+            pc = await bridge.state.get_property(dev, "CCD_CONTROLS")
+            if pc:
+                off = first_element(pc, "Offset", None)
+                if off is None:
+                    off = first_element(pc, "OFFSET", None)
+        if off is not None:
+            rig["offset"] = round(float(off), 1)
+    except Exception:  # noqa: BLE001
+        pass
     return rig
 
 
