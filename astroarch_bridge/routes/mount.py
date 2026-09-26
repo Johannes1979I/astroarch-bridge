@@ -5,6 +5,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
 from ..deps import Bridge, get_bridge
+from ..motion_watchdog import MotionWatchdog, clamp_ttl
 from ._roles import first_element, resolve_device
 
 router = APIRouter(prefix="/api/mount", tags=["mount"], dependencies=[Depends(require_token)])
@@ -99,28 +100,71 @@ async def set_tracking(
     return {"ok": True}
 
 
+# Arresto automatico dei movimenti manuali: vedi motion_watchdog.py.
+_watchdog = MotionWatchdog()
+
+_AXES = {
+    "N": ("NS", "TELESCOPE_MOTION_NS"), "S": ("NS", "TELESCOPE_MOTION_NS"),
+    "E": ("WE", "TELESCOPE_MOTION_WE"), "W": ("WE", "TELESCOPE_MOTION_WE"),
+}
+
+
+def _motion_values(direction: str, active: bool) -> dict[str, bool]:
+    if direction in ("N", "S"):
+        return {"MOTION_NORTH": active and direction == "N",
+                "MOTION_SOUTH": active and direction == "S"}
+    return {"MOTION_WEST": active and direction == "W",
+            "MOTION_EAST": active and direction == "E"}
+
+
 @router.post("/slew")
 async def slew(
-    payload: dict = Body(..., example={"direction": "N", "active": True}),
+    payload: dict = Body(..., example={"direction": "N", "active": True, "ttl_ms": 1000}),
     bridge: Bridge = Depends(get_bridge),
 ) -> dict:
-    """Slew manuale N/S/E/W. active=True parte il movimento, False lo ferma."""
+    """Slew manuale N/S/E/W. active=True parte il movimento, False lo ferma.
+
+    Con `ttl_ms` il movimento e' protetto: il client ripete la richiesta
+    finche' il tasto resta premuto e, se smette, il bridge ferma l'asse da
+    solo dopo `ttl_ms` (vedi motion_watchdog.py). Senza `ttl_ms` il
+    movimento continua fino al comando di stop, come nelle versioni < 0.9.
+    """
     dev = await resolve_device(bridge.state, "mount", payload.get("device"))
     direction = (payload.get("direction") or "").upper()
     active = bool(payload.get("active", True))
-    if direction in ("N", "S"):
-        await bridge.indi.send_switch(dev, "TELESCOPE_MOTION_NS", {
-            "MOTION_NORTH": active and direction == "N",
-            "MOTION_SOUTH": active and direction == "S",
-        })
-    elif direction in ("E", "W"):
-        await bridge.indi.send_switch(dev, "TELESCOPE_MOTION_WE", {
-            "MOTION_WEST": active and direction == "W",
-            "MOTION_EAST": active and direction == "E",
-        })
-    else:
+    if direction not in _AXES:
         raise HTTPException(status_code=400, detail="direction must be N|S|E|W")
-    return {"ok": True}
+    axis, prop = _AXES[direction]
+    ttl_ms = payload.get("ttl_ms")
+    if ttl_ms is not None:
+        try:
+            ttl_s = clamp_ttl(ttl_ms)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="ttl_ms must be a number")
+
+    if not active:
+        _watchdog.disarm(dev, axis)
+        await bridge.indi.send_switch(dev, prop, _motion_values(direction, False))
+        return {"ok": True}
+
+    if ttl_ms is not None:
+        async def stop_axis() -> None:
+            await bridge.indi.send_switch(dev, prop, _motion_values(direction, False))
+
+        if _watchdog.arm(dev, axis, direction, ttl_s, stop_axis):
+            # Ripetizione di un movimento gia' in corso: solo la scadenza si
+            # sposta, a INDI non si manda nulla.
+            return {"ok": True, "ttl_ms": round(ttl_s * 1000)}
+    else:
+        # Un movimento senza protezione annulla quella eventualmente armata,
+        # altrimenti la scadenza vecchia lo fermerebbe a sorpresa.
+        _watchdog.disarm(dev, axis)
+    try:
+        await bridge.indi.send_switch(dev, prop, _motion_values(direction, True))
+    except ConnectionError as e:
+        _watchdog.disarm(dev, axis)
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"ok": True, **({"ttl_ms": round(ttl_s * 1000)} if ttl_ms is not None else {})}
 
 
 @router.post("/slew_rate")
