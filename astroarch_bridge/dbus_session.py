@@ -126,7 +126,114 @@ def with_session_bus(env: dict[str, str] | None = None) -> dict[str, str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Guardia contro l'avvio di KStars per «attivazione automatica» D-Bus.
+#
+# Il pacchetto kstars installa /usr/share/dbus-1/services/org.kde.kstars.service
+# (Exec=/usr/bin/kstars). Con quel file, QUALUNQUE chiamata di metodo a
+# org.kde.kstars fatta con qdbus6 mentre KStars e' spento fa partire KStars:
+# qdbus6 non ha un'opzione per non avviare il servizio. Il bridge interroga
+# lo stato di Ekos ogni 3-4 secondi per conto dell'app, quindi bastava aprire
+# l'app perche' KStars si aprisse da solo, e si riapriva appena lo si chiudeva
+# (segnalato dall'utente il 18/11/2026, impronta: KStars nel cgroup
+# app-dbus-... un secondo dopo la prima GET /api/system/ekos_state).
+#
+# Regola: si parla con KStars solo se KStars c'e' gia'. Lo si avvia SOLO su
+# richiesta esplicita (POST /api/system/launch_kstars, o il pulsante master che
+# ora lo lancia per esteso prima di avviare Ekos).
+# ---------------------------------------------------------------------------
+
+KSTARS_SERVICE = "org.kde.kstars"
+#: Testo restituito dalle funzioni qdbus6 al posto dell'output quando la
+#: chiamata e' stata evitata: i chiamanti trattano gia' rc != 0 come «non
+#: leggibile», quindi a valle non cambia nulla.
+KSTARS_NOT_RUNNING = "KStars non in esecuzione"
+_KSTARS_COMMS = (b"kstars", b"kstars.bin")
+
+# Solo il «si'» del controllo sul bus resta in memoria, e per poco: un si'
+# vecchio, subito dopo la chiusura di KStars, farebbe partire proprio la
+# chiamata che lo riavvia. Il controllo sui processi invece si rifa' sempre
+# (lettura di /proc, nessun sottoprocesso).
+_OWNER_TTL = 1.0
+_owner_ok_until = 0.0
+
+
+def kstars_process_running() -> bool:
+    """True se c'e' un processo KStars vivo (kstars o kstars.bin, non zombie).
+
+    Nessun sottoprocesso: con KStars spento, il caso frequente, la guardia
+    costa una scansione di /proc."""
+    try:
+        pids = [p for p in os.listdir(_PROC) if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(f"{_PROC}/{pid}/comm", "rb") as f:
+                if f.read().strip() not in _KSTARS_COMMS:
+                    continue
+            with open(f"{_PROC}/{pid}/stat", "rb") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # "1234 (kstars) S ...": lo stato segue l'ultima ')'
+        state = stat.rsplit(b")", 1)[-1].strip()[:1]
+        if state not in (b"Z", b"X"):
+            return True
+    return False
+
+
+async def kstars_on_bus() -> bool:
+    """True se KStars gira E ha gia' registrato il suo nome sul bus.
+
+    Il secondo controllo copre i secondi dopo l'avvio, quando il processo
+    esiste ma il nome non e' ancora preso: una chiamata in quel momento
+    farebbe partire un secondo KStars. NameHasOwner e' un metodo del demone
+    del bus, che non attiva mai nulla."""
+    global _owner_ok_until
+    if not kstars_process_running():
+        _owner_ok_until = 0.0
+        return False
+    now = time.monotonic()
+    if now < _owner_ok_until:
+        return True
+    import asyncio
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "qdbus6", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.NameHasOwner", KSTARS_SERVICE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=with_session_bus(),
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        ok = proc.returncode == 0 and out.decode("utf-8", "replace").strip() == "true"
+    except (FileNotFoundError, OSError, asyncio.TimeoutError):
+        # Nel dubbio «spento»: meglio non leggere lo stato che avviarlo.
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+        ok = False
+    _owner_ok_until = (time.monotonic() + _OWNER_TTL) if ok else 0.0
+    return ok
+
+
+async def kstars_call_allowed(args) -> bool:
+    """False se la chiamata qdbus6 con questi [args] e' diretta a KStars e
+    KStars non e' sul bus: in quel caso la chiamata lo avvierebbe."""
+    if KSTARS_SERVICE not in args:
+        return True
+    return await kstars_on_bus()
+
+
+def forget_kstars_owner() -> None:
+    """Da chiamare quando KStars viene avviato o chiuso dal bridge."""
+    global _owner_ok_until
+    _owner_ok_until = 0.0
+
+
 def reset_cache() -> None:
-    """Forget the memoised address (used by the tests)."""
+    """Forget the memoised address and owner check (used by the tests)."""
     global _cache
     _cache = (0.0, None)
+    forget_kstars_owner()

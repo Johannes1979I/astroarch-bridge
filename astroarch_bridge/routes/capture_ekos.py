@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
-from ..dbus_session import with_session_bus
+from ..dbus_session import KSTARS_NOT_RUNNING, kstars_call_allowed, with_session_bus
 from ..config import get_settings
 from ..deps import Bridge, get_bridge
 
@@ -631,6 +631,9 @@ async def _stop_capture_preview() -> None:
 
 async def _dbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     """Esegue qdbus6 e ritorna (returncode, stdout)."""
+    if not await kstars_call_allowed(args):
+        # KStars spento: qdbus6 lo farebbe partire (vedi dbus_session.py).
+        return -1, KSTARS_NOT_RUNNING
     env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", *args,

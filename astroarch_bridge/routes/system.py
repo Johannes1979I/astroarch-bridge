@@ -441,6 +441,8 @@ async def launch_kstars() -> dict:
     if not ok:
         raise HTTPException(status_code=503,
             detail="kstars binary not found in PATH")
+    from ..dbus_session import forget_kstars_owner
+    forget_kstars_owner()
     _logger.info("kstars launched via DISPLAY=:0")
     return {"ok": True, "started": True, "already_running": False}
 
@@ -468,6 +470,10 @@ async def kill_kstars() -> dict:
     import logging as _log
     _logger = _log.getLogger("astroarch_bridge.system")
     n = await _pkill("kstars", "kstars.bin")
+    # Un «KStars e' sul bus» rimasto in memoria, adesso, farebbe partire
+    # proprio la chiamata che lo riavvia (vedi dbus_session.py).
+    from ..dbus_session import forget_kstars_owner
+    forget_kstars_owner()
     _logger.info("kill_kstars: terminated %d processes", n)
     return {"ok": True, "killed": n}
 
@@ -538,14 +544,8 @@ async def ekos_state(bridge: Bridge = Depends(get_bridge)) -> dict:
     vede connessi sull'INDI server: questo è più affidabile di indiStatus
     perché ignora i driver opzionali che falliscono."""
     from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
+    from ..dbus_session import kstars_on_bus
     ekos_path = "/KStars/Ekos"
-
-    rc1, raw1 = await _dbus_call(EKOS_DBUS_SERVICE, ekos_path,
-                                  "org.kde.kstars.Ekos.ekosStatus")
-    rc2, raw2 = await _dbus_call(EKOS_DBUS_SERVICE, ekos_path,
-                                  "org.kde.kstars.Ekos.indiStatus")
-    ekos_int = int(raw1) if rc1 == 0 and raw1.lstrip("-").isdigit() else None
-    indi_int = int(raw2) if rc2 == 0 and raw2.lstrip("-").isdigit() else None
 
     # Conta device INDI visibili e online dal bridge.
     try:
@@ -554,7 +554,30 @@ async def ekos_state(bridge: Bridge = Depends(get_bridge)) -> dict:
     except Exception:
         n_devices = 0
 
+    # KStars spento: il sistema e' giu', e chiederlo a KStars via D-Bus lo
+    # farebbe partire (l'app interroga questa rotta ogni 3 s). 'inactive' e
+    # non 'unknown': il pulsante master mostra «Tap per avviare Ekos» ed e'
+    # vero, perche' ekos_toggle ora avvia KStars per esteso.
+    if not await kstars_on_bus():
+        return {
+            "ekos_status": None,
+            "ekos_status_label": "unknown",
+            "indi_status": None,
+            "indi_status_label": "unknown",
+            "connected_devices": n_devices,
+            "active": "inactive",
+            "kstars_running": False,
+        }
+
+    rc1, raw1 = await _dbus_call(EKOS_DBUS_SERVICE, ekos_path,
+                                  "org.kde.kstars.Ekos.ekosStatus")
+    rc2, raw2 = await _dbus_call(EKOS_DBUS_SERVICE, ekos_path,
+                                  "org.kde.kstars.Ekos.indiStatus")
+    ekos_int = int(raw1) if rc1 == 0 and raw1.lstrip("-").isdigit() else None
+    indi_int = int(raw2) if rc2 == 0 and raw2.lstrip("-").isdigit() else None
+
     return {
+        "kstars_running": True,
         "ekos_status": ekos_int,
         "ekos_status_label": _EKOS_STATUS_LABELS.get(ekos_int, "unknown"),
         "indi_status": indi_int,
@@ -602,13 +625,75 @@ async def ekos_disconnect_devices() -> dict:
     return {"ok": rc == 0, "raw": raw}
 
 
+# Riferimento forte al compito: asyncio tiene solo riferimenti deboli, e un
+# compito senza riferimenti puo' essere raccolto a meta'.
+_ekos_start_task = None
+
+
+def _start_ekos_when_kstars_ready() -> None:
+    """Avvia (una volta sola) il compito che aspetta KStars e poi avvia Ekos."""
+    import asyncio as _asyncio
+    global _ekos_start_task
+    if _ekos_start_task is not None and not _ekos_start_task.done():
+        return
+    _ekos_start_task = _asyncio.create_task(_ekos_start_after_kstars())
+
+
+async def _ekos_start_after_kstars(timeout: float = 120.0) -> None:
+    """Aspetta che KStars abbia preso il suo nome sul bus, poi Ekos.start e
+    connectDevices. Su un Raspberry KStars impiega 15-40 s ad avviarsi."""
+    import asyncio as _asyncio
+    import logging as _log
+    import time as _time
+    from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
+    from ..dbus_session import kstars_on_bus
+    _logger = _log.getLogger("astroarch_bridge.system")
+    fine = _time.monotonic() + timeout
+    while _time.monotonic() < fine:
+        if await kstars_on_bus():
+            break
+        await _asyncio.sleep(1.0)
+    else:
+        _logger.warning("ekos_toggle: KStars non e' comparso sul bus entro %.0f s,"
+                        " Ekos non avviato", timeout)
+        return
+    # Il nome e' preso, ma l'oggetto /KStars/Ekos puo' arrivare un attimo dopo:
+    # si riprova finche' la chiamata riesce.
+    for _ in range(15):
+        await _asyncio.sleep(2.0)
+        rc, _out = await _dbus_call(EKOS_DBUS_SERVICE, "/KStars/Ekos",
+                                    "org.kde.kstars.Ekos.start")
+        if rc == 0:
+            await _asyncio.sleep(0.30)
+            await _dbus_call(EKOS_DBUS_SERVICE, "/KStars/Ekos",
+                             "org.kde.kstars.Ekos.connectDevices")
+            _logger.info("ekos_toggle: KStars avviato su richiesta, Ekos avviato")
+            return
+    _logger.warning("ekos_toggle: KStars c'e' ma Ekos.start non ha risposto")
+
+
 @router.post("/ekos_toggle")
 async def ekos_toggle(bridge: Bridge = Depends(get_bridge)) -> dict:
     """Toggle automatico: legge lo stato, poi start/stop in base a quello.
     Questo è ciò che usa il pulsante Attiva/Disattiva della Dashboard."""
     import asyncio as _asyncio
     from .capture_ekos import _dbus_call, EKOS_DBUS_SERVICE
+    from ..dbus_session import forget_kstars_owner, kstars_on_bus
     ekos_path = "/KStars/Ekos"
+
+    # Il tocco e' dell'utente, quindi qui KStars SI puo' avviare: ma per
+    # esteso, come fa il pulsante KStars, e non come effetto collaterale di
+    # una chiamata D-Bus. Ekos parte in sottofondo appena KStars e' sul bus;
+    # la risposta torna subito e il polling dell'app mostra l'avanzamento.
+    if not await kstars_on_bus():
+        if not await _pgrep_any("kstars", "kstars.bin"):
+            if not await _launch_detached("kstars"):
+                raise HTTPException(status_code=503,
+                                    detail="kstars binary not found in PATH")
+        forget_kstars_owner()
+        _start_ekos_when_kstars_ready()
+        return {"ok": True, "from": "inactive", "action": "starting",
+                "launching_kstars": True}
 
     rc1, raw1 = await _dbus_call(EKOS_DBUS_SERVICE, ekos_path,
                                   "org.kde.kstars.Ekos.ekosStatus")
@@ -875,6 +960,8 @@ async def _graceful_close_and_power(mode: str) -> None:
                 _logger.info("shutdown: terminati %d processi %s", n, names[0])
         except Exception:
             _logger.warning("shutdown: pkill %s non riuscito", names[0])
+    from ..dbus_session import forget_kstars_owner
+    forget_kstars_owner()
 
     # 3. Spegnimento vero.
     await asyncio.sleep(_POWEROFF_GRACE_SECONDS)
