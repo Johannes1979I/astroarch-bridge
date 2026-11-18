@@ -28,7 +28,7 @@ import time
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
-from ..dbus_session import with_session_bus
+from ..dbus_session import KSTARS_NOT_RUNNING, kstars_on_bus, with_session_bus
 
 router = APIRouter(prefix="/api/focuser", tags=["focuser"],
                     dependencies=[Depends(require_token)])
@@ -222,20 +222,23 @@ async def ekos_state(train: str = "") -> dict:
     # status() ritorna un type "(i)" struct: qdbus6 senza --literal non lo
     # visualizza ("I don't know how to display..."). Usiamo --literal e
     # estraiamo l'int dalla forma "[Argument: (i) <int>]".
-    proc = await asyncio.create_subprocess_exec(
-        "qdbus6", "--literal",
-        EKOS_DBUS_SERVICE, focus_path,
-        "org.kde.kstars.Ekos.Focus.status", train,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=with_session_bus(),
-    )
-    try:
-        sout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        raw = sout.decode("utf-8", "replace").strip()
-    except asyncio.TimeoutError:
-        proc.kill()
-        raw = "timeout"
+    if not await kstars_on_bus():
+        raw = KSTARS_NOT_RUNNING  # qdbus6 lo farebbe partire
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            "qdbus6", "--literal",
+            EKOS_DBUS_SERVICE, focus_path,
+            "org.kde.kstars.Ekos.Focus.status", train,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=with_session_bus(),
+        )
+        try:
+            sout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            raw = sout.decode("utf-8", "replace").strip()
+        except asyncio.TimeoutError:
+            proc.kill()
+            raw = "timeout"
     out["status_raw"] = raw
     m = re.search(r"-?\d+", raw or "")
     out["status_int"] = int(m.group(0)) if m else None

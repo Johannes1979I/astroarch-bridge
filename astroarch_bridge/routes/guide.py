@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
-from ..dbus_session import with_session_bus
+from ..dbus_session import KSTARS_NOT_RUNNING, kstars_call_allowed, with_session_bus
 from ..deps import Bridge, get_bridge
 from ..phd2.client import Phd2RpcError
 
@@ -392,6 +392,9 @@ async def star_image(
 async def _qdbus_call(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     """qdbus6 → (returncode, stdout). Copia locale isolata (non dipende da
     altri route module) per pilotare org.kde.kstars.Ekos.Guide."""
+    if not await kstars_call_allowed(args):
+        # KStars spento: qdbus6 lo farebbe partire (vedi dbus_session.py).
+        return -1, KSTARS_NOT_RUNNING
     env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", *args,

@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 
-from .dbus_session import with_session_bus
+from .dbus_session import KSTARS_NOT_RUNNING, kstars_call_allowed, with_session_bus
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,9 @@ async def _qdbus(*args: str, timeout: float = 5.0) -> tuple[int, str]:
     # sessione xrdp questo modulo deve seguirlo, altrimenti guide_camera()
     # torna None in silenzio (i chiamanti la avvolgono in except: pass) e i
     # frame della camera di guida tornano a finire nel monitor della home.
+    if not await kstars_call_allowed(args):
+        # KStars spento: qdbus6 lo farebbe partire (vedi dbus_session.py).
+        return -1, KSTARS_NOT_RUNNING
     env = with_session_bus()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -66,6 +69,11 @@ async def guide_camera(force: bool = False) -> str | None:
             return _cache_value
         rc, out = await _qdbus(_EKOS_SERVICE, _EKOS_GUIDE_PATH,
                                f"{_EKOS_GUIDE_IFACE}.camera")
+        if rc != 0 and out == KSTARS_NOT_RUNNING:
+            # Non e' «nessuna camera di guida», e' «non chiedibile adesso»:
+            # niente cache, o per 30 s dopo l'avvio di Ekos i frame di guida
+            # finirebbero nel monitor della home.
+            return None
         _cache_value = out.strip() if (rc == 0 and out.strip()) else None
         _cache_ts = time.monotonic()
         return _cache_value

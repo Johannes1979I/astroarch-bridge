@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth import require_token
-from ..dbus_session import with_session_bus
+from ..dbus_session import kstars_on_bus, with_session_bus
 from ..deps import Bridge, get_bridge
 from ._roles import resolve_device
 
@@ -344,6 +344,8 @@ async def _dbus_call_literal(path: str, method: str, *args: str,
                              timeout: float = 8.0) -> str:
     """Chiamata DBus con --literal output (per array/varianti)."""
     import asyncio
+    if not await kstars_on_bus():
+        return ""  # KStars spento: qdbus6 lo farebbe partire
     env = with_session_bus()
     proc = await asyncio.create_subprocess_exec(
         "qdbus6", "--literal",
